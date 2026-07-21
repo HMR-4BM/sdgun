@@ -1,0 +1,112 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="theme-color" content="#0b1015">
+  <title>SDGun Market Radar</title>
+  <link rel="stylesheet" href="/styles.css">
+  <link rel="stylesheet" href="/sync.css">
+</head>
+<body>
+  <div class="shell">
+    <aside class="sidebar">
+      <div class="brand"><span class="brand-mark">S</span><div><strong>Market Radar</strong><small>SDGUN INTELLIGENCE</small></div></div>
+      <nav aria-label="主导航">
+        <button class="nav-item active" data-target="overview"><span>⌁</span>市场总览</button>
+        <button class="nav-item" data-target="posts"><span>▤</span>最新帖子</button>
+        <button class="nav-item" data-target="hunter"><span>◎</span>市场猎手</button>
+        <button class="nav-item" data-target="control"><span>⌘</span>同步状态</button>
+      </nav>
+      <div class="sidebar-foot">
+        <div class="system-status"><i id="statusDot"></i><div><small>采集状态</small><strong id="sideStatus">正在连接</strong></div></div>
+        <div class="export-row"><a href="/api/export.csv">CSV</a><a href="/api/export.jsonl">JSONL</a></div>
+      </div>
+    </aside>
+
+    <main>
+      <header class="topbar">
+        <div><p class="eyebrow">SECOND-HAND MARKET INTELLIGENCE</p><h1>二手市场雷达</h1></div>
+        <div class="header-actions">
+          <div class="asof"><small>本次打开时间</small><strong id="openedAt">--:--:--</strong></div>
+          <button id="controlBtn" class="button ghost">同步状态</button>
+          <button id="refreshBtn" class="button primary"><span>↻</span> 刷新最新</button>
+        </div>
+      </header>
+
+      <section id="overview" class="section active-section">
+        <div class="section-head">
+          <div><h2>市场脉搏</h2><p>按照帖子真实发布时间统计，不受爬取时间影响</p></div>
+          <div class="segmented" id="periodPicker">
+            <button data-days="7">7天</button><button class="active" data-days="30">30天</button>
+            <button data-days="90">90天</button><button data-days="3650">全部</button>
+          </div>
+        </div>
+
+        <div class="kpi-grid">
+          <article class="kpi"><div class="kpi-top"><span>有效帖子</span><i class="cyan">▰</i></div><strong id="kpiPosts">—</strong><small id="kpiScanned">累计扫描 —</small></article>
+          <article class="kpi"><div class="kpi-top"><span>公开标记售出率</span><i class="green">◆</i></div><strong id="kpiSoldRate">—</strong><small><em id="kpiSold">—</em> 条已出</small></article>
+          <article class="kpi"><div class="kpi-top"><span>价格中位数</span><i class="amber">¥</i></div><strong id="kpiPrice">—</strong><small>仅统计明确价格语境</small></article>
+          <article class="kpi"><div class="kpi-top"><span>活跃用户</span><i class="violet">●</i></div><strong id="kpiUsers">—</strong><small><span id="kpiComments">—</span> 条已采集评论</small></article>
+        </div>
+
+        <div class="dashboard-grid">
+          <article class="panel trend-panel"><div class="panel-head"><div><h3>供需与状态趋势</h3><p>每日发帖量</p></div><div class="legend"><span><i class="sell"></i>出售</span><span><i class="sold"></i>已出</span><span><i class="wanted"></i>求购</span></div></div><div class="chart-wrap"><canvas id="trendChart" role="img" aria-label="每日出售、已出和求购趋势图"></canvas><div id="trendEmpty" class="empty-chart">等待更多数据</div></div></article>
+          <article class="panel category-panel"><div class="panel-head"><div><h3>交易状态</h3><p>当前周期分布</p></div></div><div class="donut-area"><div id="categoryDonut" class="donut"><div><strong id="donutTotal">0</strong><small>总帖数</small></div></div><div id="categoryLegend" class="category-legend"></div></div></article>
+          <article class="panel"><div class="panel-head"><div><h3>热门物品词</h3><p>标题与物品描述词频</p></div></div><div id="hotTerms" class="term-cloud"></div></article>
+          <article class="panel"><div class="panel-head"><div><h3>价格带分布</h3><p>人民币区间</p></div><span id="avgPrice" class="metric-note">均价 —</span></div><div id="priceBands" class="bar-list"></div></article>
+          <article class="panel users-panel"><div class="panel-head"><div><h3>活跃发布者</h3><p>周期内发帖次数</p></div></div><div id="topUsers" class="rank-list"></div></article>
+          <article class="panel signal-panel"><div><p class="eyebrow">DATA COVERAGE</p><h3>数据覆盖</h3></div><div class="signal-stats"><div><strong id="coverageImages">—</strong><span>帖子图片</span></div><div><strong id="coverageLinks">—</strong><span>闲鱼链接</span></div><div><strong id="latestTid">—</strong><span>最高已收录 TID</span></div></div></article>
+          <article class="panel daily-panel"><div class="panel-head"><div><h3>每日盘数据</h3><p>Asia/Taipei 自然日 · 所有指标均由实际帖子量化</p></div><a class="metric-note daily-export" href="/api/export-daily.csv">导出日盘 CSV</a></div><div class="daily-table"><div class="daily-head"><span>日期 / TID区间</span><span>发帖量</span><span>出售 / 已出 / 求购</span><span>售出率</span><span>价格中位数</span><span>活跃用户</span><span>评论 / 闲鱼</span><span>量环比</span></div><div id="dailyRows"></div></div></article>
+        </div>
+      </section>
+
+      <section id="posts" class="section">
+        <div class="section-head"><div><h2>最新帖子</h2><p>默认按实际发帖时间倒序；绿色标记表示本次打开后发现</p></div><span id="postCount" class="count-pill">0 条</span></div>
+        <div class="toolbar">
+          <label class="search"><span>⌕</span><input id="searchInput" type="search" placeholder="多关键词：用空格、逗号或顿号分隔"></label>
+          <div class="chips" id="categoryFilter"><button class="active" data-category="全部">全部</button><button data-category="出售">出售</button><button data-category="出售+求购">出售+求购</button><button data-category="部分已出">部分已出</button><button data-category="已出">已出</button><button data-category="求购">求购</button></div>
+        </div>
+        <div class="search-mode-bar">
+          <div><span>命中方式</span><div class="segmented compact" id="matchMode"><button class="active" data-match="any">部分命中</button><button data-match="all">全部命中</button></div></div>
+          <div><span>检索范围</span><div class="segmented compact" id="searchField"><button class="active" data-field="all">全部内容</button><button data-field="title">仅标题</button><button data-field="author">仅作者</button></div></div>
+          <small id="searchHint">任意关键词出现在标题、作者、正文或物品明细中即可</small>
+        </div>
+        <div class="table-panel"><div class="post-table-head"><span>帖子 / 发布者</span><span>状态</span><span>价格</span><span>发布时间</span></div><div id="postList" class="post-list"></div><button id="loadMore" class="load-more">加载更多</button></div>
+      </section>
+
+      <section id="hunter" class="section">
+        <div class="section-head"><div><h2>市场猎手</h2><p>以点击启动的时间为起点，只追踪之后发布的新帖子</p></div><span id="hunterBadge" class="mode-badge">IDLE</span></div>
+        <div class="hunter-grid">
+          <article class="panel hunter-form">
+            <label class="hunter-query"><span>检索关键词</span><input id="hunterQuery" type="search" placeholder="多个关键词用空格、逗号或顿号分隔"></label>
+            <div class="hunter-fields">
+              <label><span>命中方式</span><select id="hunterMatch"><option value="any">部分命中</option><option value="all">全部命中</option></select></label>
+              <label><span>检索范围</span><select id="hunterField"><option value="all">全部内容</option><option value="title">仅标题</option><option value="author">仅作者</option></select></label>
+              <label><span>交易状态</span><select id="hunterCategory"><option>全部</option><option>出售</option><option>出售+求购</option><option>部分已出</option><option>已出</option><option>求购</option></select></label>
+              <label><span>检索间隔（秒）</span><input id="hunterInterval" type="number" min="10" max="86400" value="30"></label>
+            </div>
+            <div class="hunter-actions"><button id="hunterStart" class="button primary">从现在开始追踪</button><button id="hunterStop" class="button danger">停止</button><span>历史帖子不会提醒 · 最短间隔 10 秒</span></div>
+          </article>
+          <article class="panel hunter-status"><div class="panel-head"><div><h3>运行状态</h3><p id="hunterMessage">猎手未启动</p></div><i id="hunterPulse"></i></div><div class="hunter-stats"><div><span>检查轮次</span><strong id="hunterChecks">0</strong></div><div><span>启动后命中</span><strong id="hunterMatches">0</strong></div><div><span>本轮新增</span><strong id="hunterNewHits">0</strong></div><div><span>下次检查</span><strong id="hunterNext">—</strong></div></div><p id="hunterError" class="task-error"></p></article>
+          <article class="panel hunter-results-panel"><div class="panel-head"><div><h3>命中结果</h3><p>点击结果会打开帖子并高亮、定位关键词</p></div><span id="hunterResultCount" class="count-pill">0 条</span></div><div id="hunterResults" class="hunter-results"><div class="daily-empty">启动猎手后将在这里显示结果</div></div></article>
+        </div>
+      </section>
+
+      <section id="control" class="section">
+        <div class="section-head"><div><h2>增量同步</h2><p>只保存一个最新 ID，每次刷新从下一个编号自动追赶到现在</p></div><div class="header-actions"><button id="syncNow" class="button primary">刷新到现在</button><button id="stopTask" class="button danger">停止</button></div></div>
+        <div class="sync-grid">
+          <article class="panel cursor-card"><p class="eyebrow">PERSISTED CURSOR</p><span>上次记录的最新 ID</span><strong id="syncLastId">—</strong><small>下次从 <em id="syncNextId">—</em> 开始，不重复扫描历史区间</small></article>
+          <article class="panel flow-card"><div><span>上次最新 ID</span><strong>+ 1</strong></div><i>→</i><div><span>自动分批追赶</span><strong>仅解析目标帖</strong></div><i>→</i><div><span>当前边界</span><strong>保存新 ID</strong></div></article>
+          <article class="panel task-card"><div class="panel-head"><div><h3>当前同步任务</h3><p id="taskMode">IDLE</p></div><i id="taskPulse"></i></div><strong id="taskMessage">空闲</strong><div class="progress"><span id="taskProgress"></span></div><div class="task-stats"><div><span>本次检查</span><strong id="taskProcessed">0</strong></div><div><span>命中交易帖</span><strong id="taskMatched">0</strong></div><div><span>刚处理 TID</span><strong id="taskLastTid">—</strong></div><div><span>运行时间</span><strong id="taskElapsed">0s</strong></div></div><p id="taskError" class="task-error"></p></article>
+        </div>
+      </section>
+    </main>
+  </div>
+
+  <aside id="detailDrawer" class="drawer" aria-hidden="true"><div class="drawer-head"><div><p class="eyebrow">POST DETAIL</p><h2 id="detailTitle">帖子详情</h2></div><button id="closeDrawer" aria-label="关闭">×</button></div><div id="detailBody" class="drawer-body"></div></aside><div id="backdrop" class="backdrop"></div>
+  <div id="imageLightbox" class="image-lightbox" aria-hidden="true"><button id="lightboxClose" aria-label="关闭大图">×</button><img id="lightboxImage" alt=""></div>
+  <div id="toast" class="toast" role="status"></div>
+  <script src="/app.js"></script>
+</body>
+</html>
