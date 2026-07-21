@@ -161,3 +161,7 @@ robots.txt 规则文件。这不等于站点授予无限制抓取许可，仍应
 ```powershell
 python -m unittest discover -v
 ```
+## 贡献者
+
+- [HMR-4BM](https://github.com/HMR-4BM) — 项目作者与维护者
+- Codex（OpenAI）— README 整理、代码协作与 GitHub 发布支持
