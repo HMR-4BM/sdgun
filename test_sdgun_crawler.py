@@ -6,6 +6,7 @@ from sdgun_crawler import (
     Settings,
     classify,
     category_from_items,
+    clean_rich_content,
     clean_rich_text,
     extract_item_details,
     extract_prices,
@@ -29,6 +30,44 @@ class ParserTests(unittest.TestCase):
             "http://pic.example/a.jpg",
             "http://pic.example/a.jpg?imageView2/3/w/600",
         ]), ["http://pic.example/a.jpg"])
+
+    def test_video_and_nested_source_tags_are_parsed(self):
+        text, images, links, videos, posters = clean_rich_content(
+            '<p>演示视频</p>'
+            '<video data-src="/media/demo.mp4" poster="/media/demo.jpg">'
+            '<source src="https://cdn.example/demo.webm" type="video/webm">'
+            '<source src="https://cdn.example/demo.webm">'
+            '您的设备不支持视频标签'
+            '</video>'
+            '<source src="https://cdn.example/not-in-video.mp4">'
+        )
+        self.assertEqual(text, "演示视频")
+        self.assertEqual(images, [])
+        self.assertEqual(videos, ["/media/demo.mp4", "https://cdn.example/demo.webm"])
+        self.assertEqual(links, videos)
+        self.assertEqual(posters, ["/media/demo.jpg"])
+
+    def test_video_posters_are_not_duplicated_as_post_images(self):
+        crawler = Crawler(Settings(1, 0, False, 50, 1, "【二手出售】", ()))
+        row = {
+            "tid": 123,
+            "create_time": 1784642106,
+            "content": (
+                '<video poster="http://pic.example/video-cover.jpg">'
+                '<source src="http://pic.example/demo.mp4" type="video/mp4">'
+                '</video><img src="http://pic.example/real-photo.jpg">'
+            ),
+            "pics": [
+                "http://pic.example/video-cover.jpg",
+                "http://pic.example/real-photo.jpg",
+            ],
+        }
+        page = '<title>【二手出售】视频帖</title><script>var row=' + json.dumps(row) + ';</script>'
+        crawler._request = lambda url: page.encode("utf-8")
+        status, post = crawler.fetch_thread(123)
+        self.assertEqual(status, "matched")
+        self.assertEqual(post["videos"], ["http://pic.example/demo.mp4"])
+        self.assertEqual(post["images"], ["http://pic.example/real-photo.jpg"])
 
     def test_prices_require_currency_context(self):
         text = "PEQ-15，2026-02-25，售价1380元，另一个¥280，4件38000"
@@ -64,6 +103,16 @@ class ParserTests(unittest.TestCase):
         details = extract_item_details("【二手出售】多件", body, [])
         self.assertEqual(len(details), 3)
         self.assertEqual([x["prices"] for x in details], [["3000"], ["400"], ["800"]])
+
+    def test_region_code_sale_prefix_is_not_an_item(self):
+        expected = ["任翔金属弹匣", "司骏尼龙弹匣", "10寸前鱼骨"]
+        for region in ("0311", "020", "0769"):
+            with self.subTest(region=region):
+                details = extract_item_details(
+                    f"【二手出售】{region}出 任翔金属弹匣 司骏尼龙弹匣 10寸前鱼骨",
+                    "20 20 50 到付", [],
+                )
+                self.assertEqual([item["name"] for item in details], expected)
 
     def test_keyword_matches_json_unicode_escape(self):
         raw = r'{"content":"\u9526\u660e\u6ce2\u7bb1"}'.casefold()

@@ -45,6 +45,7 @@ ITEM_PREFIX_RE = re.compile(
 ITEM_LINE_PRICE_RE = re.compile(
     r"(?:明盘|售价|价格|小刀|包邮)\s*[:：]?\s*[￥¥]?\s*\d{2,6}|[￥¥]\s*\d{2,6}|\d{2,6}\s*(?:元|块)", re.I
 )
+REGION_SALE_PREFIX_RE = re.compile(r"^0\d{2,3}\s*(?:出|出售|出掉|出手)\s*", re.I)
 # A number is a price only when accompanied by a currency marker.  This avoids
 # treating dates, model names (PEQ-15) and quantities as prices.
 PRICE_RE = re.compile(
@@ -54,6 +55,8 @@ PRICE_RE = re.compile(
 STOPWORDS = {
     "一个", "东西", "物品", "交易", "出售", "二手出售", "包邮", "不包邮", "价格",
     "联系", "可以", "没有", "这个", "那个", "需要", "直接", "闲鱼", "链接", "已经",
+    "明盘", "已出", "自提", "几乎全新", "全新",
+    "您的设备不支持视", "频标签",
 }
 
 
@@ -63,23 +66,45 @@ class _TextHTML(HTMLParser):
         self.parts: list[str] = []
         self.images: list[str] = []
         self.links: list[str] = []
+        self.videos: list[str] = []
+        self.video_posters: list[str] = []
+        self._video_depth = 0
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attrs_d = dict(attrs)
-        if tag.lower() == "img":
+        tag = tag.lower()
+        if tag == "img":
             src = attrs_d.get("data-original") or attrs_d.get("src")
             if src:
                 self.images.append(src)
-        if tag.lower() == "a" and attrs_d.get("href"):
+        if tag == "video":
+            self._video_depth += 1
+            if attrs_d.get("poster"):
+                self.video_posters.append(attrs_d["poster"] or "")
+            src = attrs_d.get("data-original") or attrs_d.get("data-src") or attrs_d.get("src")
+            if src:
+                self.videos.append(src)
+        elif tag == "source" and self._video_depth:
+            src = attrs_d.get("data-original") or attrs_d.get("data-src") or attrs_d.get("src")
+            if src:
+                self.videos.append(src)
+        if tag == "a" and attrs_d.get("href"):
             self.links.append(attrs_d["href"] or "")
-        if tag.lower() in {"br", "p", "div", "li", "tr"}:
+        if tag in {"br", "p", "div", "li", "tr"}:
             self.parts.append("\n")
 
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() == "video" and self._video_depth:
+            self._video_depth -= 1
+
     def handle_data(self, data: str) -> None:
+        # Text nested inside <video> is browser fallback UI, not post content.
+        if self._video_depth:
+            return
         self.parts.append(data)
 
 
-def clean_rich_text(value: str) -> tuple[str, list[str], list[str]]:
+def clean_rich_content(value: str) -> tuple[str, list[str], list[str], list[str], list[str]]:
     parser = _TextHTML()
     with contextlib.suppress(Exception):
         parser.feed(value or "")
@@ -89,7 +114,15 @@ def clean_rich_text(value: str) -> tuple[str, list[str], list[str]]:
     # multi-item listing without any model/NLP call.
     text = re.sub(r"\n[ \t]*\n(?:[ \t]*\n)*", "\n\n", text).strip()
     found_urls = URL_RE.findall(text)
-    return text, unique(parser.images), unique(parser.links + found_urls)
+    videos = unique(parser.videos)
+    posters = unique(parser.video_posters)
+    return text, unique(parser.images), unique(parser.links + videos + found_urls), videos, posters
+
+
+def clean_rich_text(value: str) -> tuple[str, list[str], list[str]]:
+    """Return plain text, images and links; video sources are included in links."""
+    text, images, links, _, _ = clean_rich_content(value)
+    return text, images, links
 
 
 def unique(values: Iterable[str]) -> list[str]:
@@ -162,6 +195,14 @@ def extract_item_prices(text: str) -> list[str]:
     return unique(values)
 
 
+def _title_item_candidates(title_item: str) -> list[str]:
+    """Split a title list after dropping a leading region-code sale marker."""
+    cleaned = REGION_SALE_PREFIX_RE.sub("", title_item).strip()
+    parts = [part.strip(" -—•\t") for part in re.split(r"\s+|[、；;]+", cleaned)]
+    parts = [part for part in parts if len(part) >= 2 and part.casefold() not in STOPWORDS]
+    return parts if len(parts) >= 2 else ([cleaned] if cleaned else [])
+
+
 def extract_item_details(title: str, body: str,
                          comments: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """Extract and classify each listed item using cheap deterministic rules."""
@@ -179,7 +220,7 @@ def extract_item_details(title: str, body: str,
         if len(candidates) >= 20:
             break
     if not candidates and title_item:
-        candidates = [title_item]
+        candidates = _title_item_candidates(title_item)
 
     details: list[dict[str, Any]] = []
     for index, text in enumerate(unique(candidates), 1):
@@ -296,7 +337,9 @@ class Crawler:
         except json.JSONDecodeError:
             return "bad_row", None
 
-        body, content_images, content_links = clean_rich_text(str(row.get("content", "")))
+        body, content_images, content_links, content_videos, content_video_posters = clean_rich_content(
+            str(row.get("content", ""))
+        )
         # row.pics belongs to the post. Never scrape arbitrary <img> elements.
         pic_urls: list[str] = []
         for pic in row.get("pics") or []:
@@ -306,11 +349,15 @@ class Crawler:
                 for key in ("url", "pic", "src", "origin_url"):
                     if pic.get(key):
                         pic_urls.append(str(pic[key])); break
-        # Prefer row.pics originals and collapse resized variants of the same image.
-        images = unique_images(absolute_url(x) for x in pic_urls + content_images)
+        # row.pics also contains <video poster> thumbnails. They belong to the
+        # player and must not be rendered again in the image gallery.
+        video_posters = set(absolute_url(x) for x in content_video_posters)
+        images = [x for x in unique_images(absolute_url(x) for x in pic_urls + content_images)
+                  if x not in video_posters]
         comments = self.fetch_comments(tid) if self.s.comments and int(row.get("reply_count") or 0) else []
         comment_links = [u for c in comments for u in c.get("links", [])]
         all_links = unique(absolute_url(x) for x in content_links + comment_links)
+        videos = unique(absolute_url(x) for x in content_videos)
         xianyu_links = [x for x in all_links if any(h in x.casefold() for h in ("2.taobao.com", "m.tb.cn", "tb.cn", "goofish.com"))]
         item_details = extract_item_details(title, body, comments)
         category = category_from_items(item_details, classify(title, body, comments))
@@ -323,6 +370,8 @@ class Crawler:
             "created_at": timestamp_text(row.get("create_time")),
             "content": body,
             "images": images,
+            "videos": videos,
+            "video_posters": list(video_posters),
             "links": all_links,
             "xianyu_links": xianyu_links,
             "comments": comments,

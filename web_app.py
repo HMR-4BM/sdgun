@@ -31,12 +31,16 @@ WEB_ROOT = ROOT / "web"
 DEFAULT_DB = ROOT / "sdgun_market.db"
 TRANSIENT = {"unreachable", "no_title", "no_row", "bad_row"}
 TERM_RE = re.compile(r"[A-Za-z][A-Za-z0-9._+-]{1,20}|[\u4e00-\u9fff]{2,8}")
+ITEM_TERM_STOPWORDS = {"二手出售", "包邮", "不包邮", "出售", "价格", "一个",
+                       "明盘", "已出", "自提", "几乎全新", "全新",
+                       "您的设备不支持视", "频标签"}
 # Taiwan has used UTC+08:00 without daylight-saving changes in the period this
 # crawler covers. A fixed offset avoids requiring the optional Windows tzdata package.
 TAIPEI = timezone(timedelta(hours=8), "Asia/Taipei")
 IMAGE_HOSTS = {"picapp.sdgun.net", "bbs.sdgun.com.cn", "sdgun.ymgames.com.cn",
                "shuidan.app1.magcloud.net"}
 MAX_IMAGE_BYTES = 25 * 1024 * 1024
+MAX_VIDEO_BYTES = 500 * 1024 * 1024
 
 
 def json_bytes(value: Any) -> bytes:
@@ -244,9 +248,18 @@ class Repository:
         store = Store(db_path)  # Ensure schema exists.
         store.close()
         with contextlib.closing(sqlite3.connect(db_path)) as db:
+            db.execute("""CREATE TABLE IF NOT EXISTS favorites (
+                tid INTEGER PRIMARY KEY,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                note TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY(tid) REFERENCES posts(tid) ON DELETE CASCADE
+            )""")
+            favorite_columns = {row[1] for row in db.execute("PRAGMA table_info(favorites)")}
+            if "note" not in favorite_columns:
+                db.execute("ALTER TABLE favorites ADD COLUMN note TEXT NOT NULL DEFAULT ''")
             db.execute("UPDATE scan_state SET status='matched' WHERE tid IN (SELECT tid FROM posts)")
             version = db.execute("SELECT value FROM metadata WHERE key='item_schema_version'").fetchone()
-            if not version or version[0] != "5":
+            if not version or version[0] != "6":
                 rows = db.execute("SELECT tid, data FROM posts").fetchall()
                 for tid, raw in rows:
                     post = json.loads(raw)
@@ -266,7 +279,7 @@ class Repository:
                                (post["category"], searchable_text(post),
                                 json.dumps(post, ensure_ascii=False), tid))
                     save_monthly_post(db_path, post)
-                db.execute("INSERT OR REPLACE INTO metadata VALUES('item_schema_version','5')")
+                db.execute("INSERT OR REPLACE INTO metadata VALUES('item_schema_version','6')")
             db.commit()
 
     def connect(self) -> sqlite3.Connection:
@@ -321,13 +334,15 @@ class Repository:
                               " ORDER BY created_at DESC, tid DESC LIMIT ? OFFSET ?",
                               params + [limit, offset]).fetchall()
         items = [json.loads(row[0]) for row in rows]
+        with contextlib.closing(self.connect()) as db:
+            favorite_ids = {row[0] for row in db.execute("SELECT tid FROM favorites").fetchall()}
+        for post in items:
+            post["is_favorite"] = int(post["tid"]) in favorite_ids
         if keyword:
             for post in items:
                 annotate_search_context(post, unique_keywords(keyword),
                                         first(query, "match", "any").lower(),
                                         first(query, "field", "all").lower())
-            items = ([post for post in items if not post.get("search_excluded")] +
-                     [post for post in items if post.get("search_excluded")])
         return {"total": total, "limit": limit, "offset": offset,
                 "items": items,
                 "excluded_on_page": sum(bool(post.get("search_excluded")) for post in items)}
@@ -335,7 +350,107 @@ class Repository:
     def post(self, tid: int) -> dict[str, Any] | None:
         with contextlib.closing(self.connect()) as db:
             row = db.execute("SELECT data FROM posts WHERE tid=?", (tid,)).fetchone()
-        return json.loads(row[0]) if row else None
+            favorite = db.execute("SELECT 1 FROM favorites WHERE tid=?", (tid,)).fetchone()
+        if not row:
+            return None
+        post = json.loads(row[0])
+        post["is_favorite"] = bool(favorite)
+        return post
+
+    def set_favorite(self, tid: int, favorite: bool) -> dict[str, Any] | None:
+        with contextlib.closing(self.connect()) as db:
+            if not db.execute("SELECT 1 FROM posts WHERE tid=?", (tid,)).fetchone():
+                return None
+            if favorite:
+                db.execute("INSERT OR IGNORE INTO favorites(tid) VALUES(?)", (tid,))
+            else:
+                db.execute("DELETE FROM favorites WHERE tid=?", (tid,))
+            db.commit()
+        return {"tid": tid, "is_favorite": favorite}
+
+    def favorites(self) -> dict[str, Any]:
+        with contextlib.closing(self.connect()) as db:
+            rows = db.execute(
+                """SELECT p.data, f.note, f.created_at AS favorited_at
+                   FROM favorites f JOIN posts p ON p.tid=f.tid
+                   ORDER BY f.created_at DESC, f.tid DESC"""
+            ).fetchall()
+        items = []
+        for row in rows:
+            post = json.loads(row["data"])
+            post.update(is_favorite=True, note=row["note"], favorited_at=row["favorited_at"])
+            items.append(post)
+        return {"total": len(items), "items": items}
+
+    def set_favorite_note(self, tid: int, note: str) -> dict[str, Any] | None:
+        note = str(note).strip()
+        if len(note) > 1000:
+            raise ValueError("备注不能超过 1000 字")
+        with contextlib.closing(self.connect()) as db:
+            if not db.execute("SELECT 1 FROM favorites WHERE tid=?", (tid,)).fetchone():
+                return None
+            db.execute("UPDATE favorites SET note=? WHERE tid=?", (note, tid))
+            db.commit()
+        return {"tid": tid, "note": note}
+
+    def update_post_status(self, tid: int, status: str) -> dict[str, Any] | None:
+        status = str(status).strip()
+        allowed = {"出售", "出售+求购", "部分已出", "已出", "求购", "待确认"}
+        if status not in allowed:
+            raise ValueError("交易状态无效")
+
+        with contextlib.closing(self.connect()) as db:
+            row = db.execute("SELECT data FROM posts WHERE tid=?", (tid,)).fetchone()
+            if not row:
+                return None
+            post = json.loads(row[0])
+            post["category"] = status
+            post["is_sold"] = status == "已出"
+            if status in {"出售", "已出", "求购", "待确认"}:
+                for item in post.get("item_details", []):
+                    if isinstance(item, dict):
+                        item["status"] = status
+            db.execute(
+                "UPDATE posts SET category=?, search_text=?, data=? WHERE tid=?",
+                (status, searchable_text(post), json.dumps(post, ensure_ascii=False), tid),
+            )
+            db.commit()
+
+        save_monthly_post(self.db_path, post)
+        self.rebuild_daily()
+        return post
+
+    def refresh_post(self, tid: int) -> dict[str, Any] | None:
+        previous = self.post(tid)
+        if not previous:
+            return None
+        crawler = Crawler(TaskManager.settings({
+            "timeout": 10, "retries": 1, "comments": True, "max_comment_pages": 20,
+        }))
+        fetch_status, post = crawler.fetch_thread(tid)
+        if fetch_status != "matched" or not post:
+            messages = {
+                "unreachable": "暂时无法连接原帖", "no_title": "原帖不存在或无法读取",
+                "no_row": "原帖内容暂时无法解析", "bad_row": "原帖返回了无效数据",
+                "skipped_title": "原帖标题已不符合交易帖规则",
+                "skipped_keyword": "原帖已不符合关键词规则",
+            }
+            raise RuntimeError(messages.get(fetch_status, f"更新失败：{fetch_status}"))
+        store = Store(self.db_path)
+        try:
+            store.save_result(tid, fetch_status, post)
+        finally:
+            store.close()
+        self.rebuild_daily()
+        refreshed = self.post(tid) or post
+        old_status = previous.get("category", "待确认")
+        new_status = refreshed.get("category", "待确认")
+        return {
+            "post": refreshed, "previous_status": old_status, "current_status": new_status,
+            "status_changed": old_status != new_status,
+            "message": (f"状态已由{old_status}更新为{new_status}"
+                        if old_status != new_status else f"状态仍为{new_status}"),
+        }
 
     def all_posts(self, limit: int | None = 10000) -> list[dict[str, Any]]:
         with contextlib.closing(self.connect()) as db:
@@ -397,7 +512,7 @@ class Repository:
             comment_count += len(post.get("comments", []))
             for item in post.get("items", []):
                 for term in TERM_RE.findall(item):
-                    if len(term) >= 2 and term not in {"二手出售", "包邮", "不包邮", "出售", "价格", "一个"}:
+                    if len(term) >= 2 and term not in ITEM_TERM_STOPWORDS:
                         terms[term.casefold()] += 1
         dates = [(cutoff.date() + timedelta(days=i)).isoformat() for i in range(days + 1)]
         return {
@@ -457,7 +572,8 @@ def annotate_search_context(post: dict[str, Any], keywords: list[str],
     for keyword in keywords:
         escaped = re.escape(keyword)
         negative = re.compile(
-            rf"(?:不含|不带|没有|没带|无|不要|不收|不出|不包括)\s*[^，。；;\n]{{0,4}}?{escaped}|"
+            rf"(?:不含|不带|没有|没带|不要|不收|不出|不包括)\s*[^，。；;\n]{{0,4}}?{escaped}|"
+            rf"无(?!刷)\s*{escaped}|"
             rf"{escaped}\s*(?:除外|不要)", re.I)
         has_negative = bool(negative.search(text))
         positive_text = negative.sub("", text)
@@ -522,7 +638,7 @@ def build_daily_market(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         for post in day_posts:
             for item in post.get("items", []):
                 for term in TERM_RE.findall(item):
-                    if len(term) >= 2 and term not in {"二手出售", "包邮", "不包邮", "出售", "价格", "一个"}:
+                    if len(term) >= 2 and term not in ITEM_TERM_STOPWORDS:
                         terms[term.casefold()] += 1
         sale_base = categories["出售"] + categories["已出"]
         row: dict[str, Any] = {
@@ -748,16 +864,33 @@ class Handler(BaseHTTPRequestHandler):
             raise ValueError("请求内容必须是 JSON 对象")
         return value
 
+    def update_post_status(self) -> bool:
+        path = urllib.parse.urlsplit(self.path).path
+        parts = path.strip("/").split("/")
+        if len(parts) != 4 or parts[:2] != ["api", "posts"] or parts[3] != "status":
+            return False
+        tid = int(parts[2])
+        payload = self.read_json()
+        if "status" not in payload:
+            raise ValueError("缺少 status 字段")
+        result = self.app.repo.update_post_status(tid, payload["status"])
+        self.send_json(result or {"error": "帖子不存在"}, 200 if result else 404)
+        return True
+
     def do_GET(self) -> None:
         url = urllib.parse.urlsplit(self.path)
         query = urllib.parse.parse_qs(url.query)
         try:
+            if url.path == "/favicon.ico":
+                return self.serve_static("/favicon.svg")
             if url.path == "/api/summary":
                 payload = self.app.repo.summary(query)
                 payload["scan"] = self.app.repo.scan_stats()
                 return self.send_json(payload)
             if url.path == "/api/posts":
                 return self.send_json(self.app.repo.posts(query))
+            if url.path == "/api/favorites":
+                return self.send_json(self.app.repo.favorites())
             if url.path.startswith("/api/posts/"):
                 post = self.app.repo.post(int(url.path.rsplit("/", 1)[1]))
                 return self.send_json(post or {"error": "帖子不存在"}, 200 if post else 404)
@@ -767,6 +900,8 @@ class Handler(BaseHTTPRequestHandler):
                 return self.send_json(self.app.hunter.snapshot())
             if url.path == "/api/image":
                 return self.proxy_image(first(query, "url", ""))
+            if url.path == "/api/video":
+                return self.proxy_video(first(query, "url", ""))
             if url.path == "/api/daily":
                 return self.send_json(self.app.repo.daily(query))
             if url.path == "/api/export.jsonl":
@@ -807,6 +942,13 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self) -> None:
         try:
+            if self.update_post_status():
+                return
+            path = urllib.parse.urlsplit(self.path).path
+            parts = path.strip("/").split("/")
+            if len(parts) == 4 and parts[:2] == ["api", "posts"] and parts[3] == "refresh":
+                result = self.app.repo.refresh_post(int(parts[2]))
+                return self.send_json(result or {"error": "帖子不存在"}, 200 if result else 404)
             if self.path == "/api/tasks/watch":
                 ok, message = self.app.tasks.start("watch", self.read_json())
                 return self.send_json({"ok": ok, "message": message}, 202 if ok else 409)
@@ -822,9 +964,30 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/api/hunter/stop":
                 ok = self.app.hunter.stop()
                 return self.send_json({"ok": ok, "message": "市场猎手正在停止" if ok else "市场猎手未运行"})
+            if self.path.startswith("/api/favorites/"):
+                tid = int(self.path.rsplit("/", 1)[1])
+                payload = self.read_json()
+                if "note" in payload:
+                    result = self.app.repo.set_favorite_note(tid, payload["note"])
+                else:
+                    result = self.app.repo.set_favorite(tid, bool(payload.get("favorite", True)))
+                return self.send_json(result or {"error": "帖子不存在"}, 200 if result else 404)
             return self.send_json({"error": "接口不存在"}, 404)
         except (ValueError, KeyError, json.JSONDecodeError) as exc:
             return self.send_json({"error": str(exc)}, 400)
+        except RuntimeError as exc:
+            return self.send_json({"error": str(exc)}, 502)
+
+    def do_PATCH(self) -> None:
+        try:
+            if self.update_post_status():
+                return
+            return self.send_json({"error": "接口不存在"}, 404)
+        except (ValueError, KeyError, json.JSONDecodeError) as exc:
+            return self.send_json({"error": str(exc)}, 400)
+
+    def do_PUT(self) -> None:
+        return self.do_PATCH()
 
     def proxy_image(self, source: str) -> None:
         parsed = urllib.parse.urlsplit(source)
@@ -856,6 +1019,46 @@ class Handler(BaseHTTPRequestHandler):
             "Cache-Control": "public, max-age=86400",
             "X-Content-Type-Options": "nosniff",
         })
+
+    def proxy_video(self, source: str) -> None:
+        parsed = urllib.parse.urlsplit(source)
+        hostname = (parsed.hostname or "").lower()
+        if parsed.scheme not in {"http", "https"} or hostname not in IMAGE_HOSTS:
+            return self.send_json({"error": "不允许的视频地址"}, 403)
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Referer": "http://app.sdgun.com.cn/",
+            "Accept": "video/*,*/*;q=0.8",
+        }
+        requested_range = self.headers.get("Range")
+        if requested_range:
+            headers["Range"] = requested_range
+        request = urllib.request.Request(source, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=30) as response:
+                final_host = (urllib.parse.urlsplit(response.geturl()).hostname or "").lower()
+                if final_host not in IMAGE_HOSTS:
+                    return self.send_json({"error": "视频跳转到了不允许的地址"}, 403)
+                content_type = response.headers.get_content_type()
+                if not content_type.startswith("video/") and content_type != "application/octet-stream":
+                    return self.send_json({"error": "上游返回的不是视频"}, 502)
+                declared = int(response.headers.get("Content-Length") or 0)
+                if declared > MAX_VIDEO_BYTES:
+                    return self.send_json({"error": "视频超过500MB限制"}, 413)
+                data = response.read(MAX_VIDEO_BYTES + 1)
+                if len(data) > MAX_VIDEO_BYTES:
+                    return self.send_json({"error": "视频超过500MB限制"}, 413)
+                response_headers = {
+                    "Cache-Control": "public, max-age=86400",
+                    "Accept-Ranges": response.headers.get("Accept-Ranges", "bytes"),
+                    "X-Content-Type-Options": "nosniff",
+                }
+                if response.headers.get("Content-Range"):
+                    response_headers["Content-Range"] = response.headers["Content-Range"]
+                status = getattr(response, "status", 200)
+        except Exception as exc:
+            return self.send_json({"error": f"视频读取失败: {exc}"}, 502)
+        return self.send_data(data, content_type, status=status, extra_headers=response_headers)
 
     def serve_static(self, path: str) -> None:
         relative = "index.html" if path in {"", "/"} else path.lstrip("/")

@@ -5,8 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#0b1015">
   <title>SDGun Market Radar</title>
+  <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/styles.css">
   <link rel="stylesheet" href="/sync.css">
+  <link rel="stylesheet" href="/favorites.css">
 </head>
 <body>
   <div class="shell">
@@ -15,6 +17,7 @@
       <nav aria-label="主导航">
         <button class="nav-item active" data-target="overview"><span>⌁</span>市场总览</button>
         <button class="nav-item" data-target="posts"><span>▤</span>最新帖子</button>
+        <button class="nav-item" data-target="favorites"><span>★</span>我的收藏</button>
         <button class="nav-item" data-target="hunter"><span>◎</span>市场猎手</button>
         <button class="nav-item" data-target="control"><span>⌘</span>同步状态</button>
       </nav>
@@ -38,7 +41,7 @@
         <div class="section-head">
           <div><h2>市场脉搏</h2><p>按照帖子真实发布时间统计，不受爬取时间影响</p></div>
           <div class="segmented" id="periodPicker">
-            <button data-days="7">7天</button><button class="active" data-days="30">30天</button>
+            <button data-days="1">1天</button><button data-days="7">7天</button><button class="active" data-days="30">30天</button>
             <button data-days="90">90天</button><button data-days="3650">全部</button>
           </div>
         </div>
@@ -73,6 +76,11 @@
           <small id="searchHint">任意关键词出现在标题、作者、正文或物品明细中即可</small>
         </div>
         <div class="table-panel"><div class="post-table-head"><span>帖子 / 发布者</span><span>状态</span><span>价格</span><span>发布时间</span></div><div id="postList" class="post-list"></div><button id="loadMore" class="load-more">加载更多</button></div>
+      </section>
+
+      <section id="favorites" class="section">
+        <div class="section-head"><div><h2>我的收藏</h2><p>每次打开都会读取帖子当前状态；备注仅保存在本机</p></div><span id="favoriteCount" class="count-pill">0 条</span></div>
+        <div id="favoriteList" class="favorite-list"><div class="daily-empty">暂无收藏帖子</div></div>
       </section>
 
       <section id="hunter" class="section">
