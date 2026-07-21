@@ -161,19 +161,3 @@ robots.txt 规则文件。这不等于站点授予无限制抓取许可，仍应
 ```powershell
 python -m unittest discover -v
 ```
-
-## 提交到 GitHub
-
-首次发布可在项目目录执行：
-
-```powershell
-git init
-git add README.md .gitignore sdgun_crawler.py web_app.py start_web.bat web test_sdgun_crawler.py test_web_app.py
-git commit -m "Initial release: SDGun market crawler and dashboard"
-git branch -M main
-git remote add origin https://github.com/<你的用户名>/<仓库名>.git
-git push -u origin main
-```
-
-提交前建议运行测试，并用 `git status` 确认数据库、缓存和采集样本没有进入暂存区。
-如果你确实需要发布示例数据，请先移除敏感信息，并使用体积较小的脱敏文件。
