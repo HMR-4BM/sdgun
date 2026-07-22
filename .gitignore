@@ -9,6 +9,12 @@ venv/
 .coverage
 htmlcov/
 
+# Desktop packaging outputs
+build/
+dist/
+*.spec
+.exe/*.exe
+
 # Local crawler data and exports
 *.db
 *.db-shm

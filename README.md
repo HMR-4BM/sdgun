@@ -23,11 +23,19 @@
 ├── web_app.py             # 本地 Web 服务与数据 API
 ├── web/                   # Web 控制台静态资源
 ├── start_web.bat          # Windows 一键启动脚本
-├── test_sdgun_crawler.py  # 爬虫与解析逻辑测试
-└── test_web_app.py        # Web、检索与归档逻辑测试
+├── desktop_app.py         # 桌面窗口及 Python 服务生命周期托管
+├── .exe/                  # Windows 成品、构建脚本及桌面依赖
+├── packaging/             # PyInstaller 生成的打包配置（构建时创建）
+├── samples/captured/      # 本地抓取的 HTML、JSONL 与页面脚本样本
+├── tests/                 # 自动化测试
+│   └── fixtures/          # 本地测试数据库
+└── data/
+    ├── main/              # 当前运行主数据库及 WAL/SHM
+    └── archive/YYYY/MM/   # 按发帖月份生成的 SQLite 归档
 ```
 
-程序运行后生成的 `*.db`、`data/`、导出文件和缓存属于本地数据，默认不会提交到 Git。
+`data/main/sdgun_market.db` 是当前运行库；`data/archive/` 是按月归档。程序生成的
+`*.db`、导出文件、样本和缓存属于本地数据，默认不会提交到 Git。
 
 面向按数字 `tid` 排列的帖子页。程序先检查 `<title>`，仅当标题以
 `【二手出售】` 开头时才解析帖子 JSON 和请求评论，因此非目标页不会进入正文、图片、
@@ -82,6 +90,29 @@ python web_app.py
 价格带、热门物品词、活跃发布者、最新帖子、详情查看、多关键词检索、增量同步、
 任务停止以及 CSV/JSONL 导出。
 
+### Windows 桌面版（关闭窗口即停止 Python）
+
+双击 `.exe\build_desktop.bat` 构建，首次构建会安装 PyWebView 和 PyInstaller。产物位于：
+
+```text
+.exe\SDGun-Market.exe
+```
+
+将 `SDGun-Market.exe` 放在可写目录中运行。程序会自动启动本地 Python 服务并在独立
+桌面窗口中打开控制台；关闭该窗口后，本地服务、市场猎手和正在执行的采集任务都会停止，
+不会继续留在后台。数据库保存在 exe 同目录的 `data/main/sdgun_market.db`；复制 exe 时
+如需保留数据，请一并复制整个 `data` 目录。
+
+开发时可先直接运行桌面入口验证：
+
+```powershell
+python -m pip install pywebview
+python desktop_app.py
+```
+
+原有的 `start_web.bat` 和 `python web_app.py` 仍是普通浏览器模式；浏览器自身没有可靠的
+“最后一个标签页关闭”通知，因此该模式下服务需要在终端按 `Ctrl+C` 停止。
+
 搜索框支持使用空格、逗号、顿号或分号分隔多个关键词；可选择“部分命中”（任意词）或
 “全部命中”（每个词都必须出现），并可把检索范围限定为全部内容、仅标题或仅作者。
 检索结果提供“快速定位”：打开帖子后会在标题、作者、正文、物品明细和评论中高亮关键词，
@@ -110,8 +141,8 @@ SQLite 的 `daily_market` 表。每盘量化保存：首末 TID、首末发帖�
 中位数、最低价、最高价、标价合计、评论、图片、闲鱼链接、热门物品词、活跃发布者、
 发帖量日环比和中位价日环比。面板可直接查看，并通过“导出日盘 CSV”下载完整日线。
 
-帖子同时按实际发帖时间归档到 `data/YYYY/MM/market.db`，磁盘文件夹最小分到月份；
-月库内部使用 `post_day` 区分具体日期并建立日期索引。根目录数据库保留全局游标、扫描状态
+帖子同时按实际发帖时间归档到 `data/archive/YYYY/MM/market.db`，磁盘文件夹最小分到月份；
+月库内部使用 `post_day` 区分具体日期并建立日期索引。`data/main/` 主数据库保留全局游标、扫描状态
 和面板运行索引，月库用于按年月归档管理，不为每天创建零碎数据库文件。
 
 首次使用时应把区间改成当前实际的七位数 `tid`。建议倒序扫描，`--end` 小于
@@ -125,10 +156,11 @@ SQLite 的 `daily_market` 表。每盘量化保存：首末 TID、首末发帖�
 
 ## 输出字段
 
-每个命中帖包含：`tid/url/title/username/user_id/created_at/content/images/links/`
+每个命中帖包含：`tid/url/title/username/user_id/created_at/content/images/videos/links/`
 `xianyu_links/comments/category/is_sold/items/item_details/prices`。其中：
 
 - `images` 只来自帖子内嵌正文和 `row.pics`，不扫描整页 `<img>`，不会混入头像、广告、等级图标；程序只保存图片 URL，不下载或识别图片。
+- `videos` 来自正文的 `<video src>` 及其嵌套 `<source src>` 标签，支持常见的 `data-src` / `data-original` 懒加载属性；视频 URL 同时保留在 `links` 中。
 - 评论分页接口只对标题与关键词均命中的帖子调用；评论正文中的闲鱼、淘宝短链等会进入 `links`，已识别的闲鱼链接同时进入 `xianyu_links`。
 - `item_details` 按空行、编号/项目符号和“一行一件明盘价”拆分，每件物品分别保存状态与价格。
   多物品帖只有部分物品售出时，帖子状态为 `部分已出`；无物品指向的笼统“已出”评论不会把整帖全部标成已出。

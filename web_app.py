@@ -28,7 +28,7 @@ from sdgun_crawler import (Crawler, Settings, Store, category_from_items,
 
 ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
-DEFAULT_DB = ROOT / "sdgun_market.db"
+DEFAULT_DB = ROOT / "data" / "main" / "sdgun_market.db"
 TRANSIENT = {"unreachable", "no_title", "no_row", "bad_row"}
 TERM_RE = re.compile(r"[A-Za-z][A-Za-z0-9._+-]{1,20}|[\u4e00-\u9fff]{2,8}")
 ITEM_TERM_STOPWORDS = {"二手出售", "包邮", "不包邮", "出售", "价格", "一个",
@@ -259,7 +259,7 @@ class Repository:
                 db.execute("ALTER TABLE favorites ADD COLUMN note TEXT NOT NULL DEFAULT ''")
             db.execute("UPDATE scan_state SET status='matched' WHERE tid IN (SELECT tid FROM posts)")
             version = db.execute("SELECT value FROM metadata WHERE key='item_schema_version'").fetchone()
-            if not version or version[0] != "6":
+            if not version or version[0] != "7":
                 rows = db.execute("SELECT tid, data FROM posts").fetchall()
                 for tid, raw in rows:
                     post = json.loads(raw)
@@ -279,7 +279,7 @@ class Repository:
                                (post["category"], searchable_text(post),
                                 json.dumps(post, ensure_ascii=False), tid))
                     save_monthly_post(db_path, post)
-                db.execute("INSERT OR REPLACE INTO metadata VALUES('item_schema_version','6')")
+                db.execute("INSERT OR REPLACE INTO metadata VALUES('item_schema_version','7')")
             db.commit()
 
     def connect(self) -> sqlite3.Connection:

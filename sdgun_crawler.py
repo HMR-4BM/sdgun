@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import Any, Iterable
 
 BASE = "http://app.sdgun.com.cn"
+DEFAULT_DB = Path(__file__).resolve().parent / "data" / "main" / "sdgun_market.db"
 THREAD_URL = BASE + "/mag/circle/v1/forum/threadWapPage?tid={}"
 COMMENT_URL = BASE + "/mag/circle/v1/Forum/commentList"
 FORUM_LIST_URL = BASE + "/mag/circle/v1/Forum/threadList"
@@ -45,6 +46,7 @@ ITEM_PREFIX_RE = re.compile(
 ITEM_LINE_PRICE_RE = re.compile(
     r"(?:明盘|售价|价格|小刀|包邮)\s*[:：]?\s*[￥¥]?\s*\d{2,6}|[￥¥]\s*\d{2,6}|\d{2,6}\s*(?:元|块)", re.I
 )
+TRAILING_BARE_PRICE_RE = re.compile(r"(?<![\dA-Za-z-])(\d{1,6}(?:\.\d{1,2})?)\s*$")
 REGION_SALE_PREFIX_RE = re.compile(r"^0\d{2,3}\s*(?:出|出售|出掉|出手)\s*", re.I)
 # A number is a price only when accompanied by a currency marker.  This avoids
 # treating dates, model names (PEQ-15) and quantities as prices.
@@ -203,11 +205,30 @@ def _title_item_candidates(title_item: str) -> list[str]:
     return parts if len(parts) >= 2 else ([cleaned] if cleaned else [])
 
 
+def _normalized_item_name(text: str) -> str:
+    """Reduce common seller/material descriptions to the advertised model name."""
+    cleaned = ITEM_PREFIX_RE.sub("", text).strip()
+    cleaned = re.sub(r"[（(][^）)]*[）)]", "", cleaned)
+    cleaned = TRAILING_BARE_PRICE_RE.sub("", cleaned).strip(" -—•\t")
+    folded = cleaned.casefold()
+    if re.search(r"\btango\s*6t\b", folded):
+        return "tango 6t"
+    if re.search(r"\bbcm\s*t2\s*支架", folded):
+        return "bcm t2支架"
+    if re.search(r"\bunity\s*(?:增高|支架)", folded):
+        return "unity 支架"
+    if (re.search(r"(?<![a-z0-9])kg(?![a-z0-9])", folded)
+            and "radian" in folded):
+        return "kg radian"
+    return cleaned
+
+
 def extract_item_details(title: str, body: str,
                          comments: list[dict[str, Any]] | None = None) -> list[dict[str, Any]]:
     """Extract and classify each listed item using cheap deterministic rules."""
     title_item = re.sub(r"^【二手出售】\s*", "", title).strip(" -—:：")
     raw_blocks = _item_blocks(body)
+    structured_bare_prices = len(raw_blocks) >= 2
     candidates: list[str] = []
     for block in raw_blocks:
         compact = re.sub(r"\s+", " ", block).strip(" -—•\t")
@@ -215,6 +236,7 @@ def extract_item_details(title: str, body: str,
             continue
         marked = bool(ITEM_PREFIX_RE.match(block))
         if (marked or PRICE_RE.search(compact) or ITEM_LINE_PRICE_RE.search(compact)
+                or (structured_bare_prices and TRAILING_BARE_PRICE_RE.search(compact))
                 or SOLD_RE.search(compact) or WANTED_RE.search(compact)):
             candidates.append(compact)
         if len(candidates) >= 20:
@@ -228,11 +250,26 @@ def extract_item_details(title: str, body: str,
         status = "已出" if SOLD_RE.search(evidence) else ("求购" if WANTED_RE.search(text) else "出售")
         details.append({
             "index": index,
-            "name": ITEM_PREFIX_RE.sub("", text).strip(),
+            "name": _normalized_item_name(text),
             "text": text,
             "status": status,
             "prices": extract_item_prices(text),
         })
+
+    merged: list[dict[str, Any]] = []
+    by_name: dict[str, dict[str, Any]] = {}
+    for detail in details:
+        key = str(detail["name"]).casefold()
+        if key in by_name:
+            existing = by_name[key]
+            existing["prices"] = unique(list(existing["prices"]) + list(detail["prices"]))
+            if detail["status"] == "已出":
+                existing["status"] = "已出"
+            continue
+        detail["index"] = len(merged) + 1
+        by_name[key] = detail
+        merged.append(detail)
+    details = merged
 
     # A generic “已出” comment can close a one-item listing. For a multi-item
     # listing it only affects an item when the comment names it or its number.
@@ -484,11 +521,14 @@ def monthly_db_path(main_db: Path, created_at: str) -> Path | None:
     year, month, _ = post_date_parts(created_at)
     if year is None or month is None:
         return None
-    return main_db.parent / "data" / f"{year:04d}" / f"{month:02d}" / "market.db"
+    data_root = (main_db.parent.parent
+                 if main_db.parent.name == "main" and main_db.parent.parent.name == "data"
+                 else main_db.parent / "data")
+    return data_root / "archive" / f"{year:04d}" / f"{month:02d}" / "market.db"
 
 
 def save_monthly_post(main_db: Path, post: dict[str, Any]) -> None:
-    """Mirror one target post into data/YYYY/MM/market.db for file-level management."""
+    """Mirror one target post into data/archive/YYYY/MM/market.db."""
     target = monthly_db_path(main_db, str(post.get("created_at", "")))
     if target is None:
         return
@@ -521,6 +561,7 @@ def save_monthly_post(main_db: Path, post: dict[str, Any]) -> None:
 class Store:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.path.parent.mkdir(parents=True, exist_ok=True)
         self.lock = threading.Lock()
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
@@ -745,12 +786,12 @@ def parser() -> argparse.ArgumentParser:
     s.add_argument("--no-comments", action="store_true")
     s.add_argument("--comment-page-size", type=int, default=50)
     s.add_argument("--max-comment-pages", type=int, default=20)
-    s.add_argument("--db", default="sdgun_market.db")
+    s.add_argument("--db", default=str(DEFAULT_DB))
     s.add_argument("--jsonl", help="另外导出本次命中为 JSONL")
     s.add_argument("--new-only", action=argparse.BooleanOptionalAction, default=True)
     s.set_defaults(func=scan)
     r = sub.add_parser("report", help="生成轻量趋势摘要")
-    r.add_argument("--db", default="sdgun_market.db")
+    r.add_argument("--db", default=str(DEFAULT_DB))
     r.add_argument("--limit", type=int, default=1000)
     r.add_argument("--top", type=int, default=30)
     r.add_argument("--latest", type=int, default=20)
@@ -768,7 +809,7 @@ def parser() -> argparse.ArgumentParser:
     w.add_argument("--no-comments", action="store_true")
     w.add_argument("--comment-page-size", type=int, default=50)
     w.add_argument("--max-comment-pages", type=int, default=20)
-    w.add_argument("--db", default="sdgun_market.db")
+    w.add_argument("--db", default=str(DEFAULT_DB))
     w.set_defaults(func=watch)
     return p
 

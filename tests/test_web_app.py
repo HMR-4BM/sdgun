@@ -62,7 +62,7 @@ class RepositoryTests(unittest.TestCase):
         finally:
             db.close()
         self.assertEqual(tuple(row), (2026, 7, "2026-07-20"))
-        monthly = self.path.parent / "data" / "2026" / "07" / "market.db"
+        monthly = self.path.parent / "data" / "archive" / "2026" / "07" / "market.db"
         self.assertTrue(monthly.exists())
 
     def test_keyword_match_mode_and_search_field(self):
@@ -153,7 +153,7 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(self.repo.post(20)["category"], "已出")
         self.assertEqual(self.repo.summary({"days": ["3650"]})["kpis"]["sold"], 2)
 
-        monthly = self.path.parent / "data" / "2026" / "07" / "market.db"
+        monthly = self.path.parent / "data" / "archive" / "2026" / "07" / "market.db"
         root_db = self.repo.connect()
         try:
             root_status = root_db.execute("SELECT category FROM posts WHERE tid=20").fetchone()[0]

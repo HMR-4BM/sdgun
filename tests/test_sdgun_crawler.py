@@ -114,6 +114,23 @@ class ParserTests(unittest.TestCase):
                 )
                 self.assertEqual([item["name"] for item in details], expected)
 
+    def test_descriptive_bare_price_lines_are_normalized_and_deduplicated(self):
+        body = (
+            "前置分化 鹰眼 黑色 tango 6t ➕boc镜桥 750\n\n"
+            "gc bcm t2 支架（断点刻字非pdd） 160\n\n"
+            "eg unity 增高 50\n\n"
+            "pdd unity 增高 15\n\n"
+            "kg vfc 钛合金radian 快慢 280"
+        )
+        details = extract_item_details(
+            "【二手出售】出 tango 6t bcm t2支架 unity 支架 kg radian",
+            body, [],
+        )
+        self.assertEqual(
+            [item["name"] for item in details],
+            ["tango 6t", "bcm t2支架", "unity 支架", "kg radian"],
+        )
+
     def test_keyword_matches_json_unicode_escape(self):
         raw = r'{"content":"\u9526\u660e\u6ce2\u7bb1"}'.casefold()
         self.assertTrue(keyword_in_raw_page("锦明", raw))
