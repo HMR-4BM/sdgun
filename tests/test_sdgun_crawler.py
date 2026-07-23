@@ -10,6 +10,9 @@ from sdgun_crawler import (
     clean_rich_text,
     extract_item_details,
     extract_prices,
+    forum_post_type,
+    is_market_post,
+    is_secondhand_sale,
     keyword_in_raw_page,
     unique_images,
 )
@@ -51,6 +54,9 @@ class ParserTests(unittest.TestCase):
         crawler = Crawler(Settings(1, 0, False, 50, 1, "【二手出售】", ()))
         row = {
             "tid": 123,
+            "fid": 176,
+            "typeid": 102,
+            "title": "【二手出售】视频帖",
             "create_time": 1784642106,
             "content": (
                 '<video poster="http://pic.example/video-cover.jpg">'
@@ -131,6 +137,15 @@ class ParserTests(unittest.TestCase):
             ["tango 6t", "bcm t2支架", "unity 支架", "kg radian"],
         )
 
+    def test_thread_url_query_numbers_are_not_bare_prices_or_items(self):
+        body = (
+            "http://app.sdgun.com.cn/mag/circle/v1/forum/threadWapPage?"
+            "tid=3959104&themecolor=000000&circle_id=185\n\n降价5.5张"
+        )
+        details = extract_item_details("【二手出售】0311出精击pdx", body, [])
+        self.assertEqual([item["name"] for item in details], ["精击pdx"])
+        self.assertNotIn("http", " ".join(item["name"] for item in details).casefold())
+
     def test_keyword_matches_json_unicode_escape(self):
         raw = r'{"content":"\u9526\u660e\u6ce2\u7bb1"}'.casefold()
         self.assertTrue(keyword_in_raw_page("锦明", raw))
@@ -139,24 +154,68 @@ class ParserTests(unittest.TestCase):
     def test_non_market_page_only_exposes_second_precision_boundary_time(self):
         crawler = Crawler(Settings(1, 0, False, 50, 1, "【二手出售】", ()))
         crawler._request = lambda url: (
-            '<title>【其他】普通帖子</title><script>var row={"create_time":"1784524303"};</script>'
+            '<title>【二手出售】伪装标题</title>'
+            '<script>var row={"fid":"99","title":"【二手出售】伪装标题",'
+            '"create_time":"1784524303"};</script>'
         ).encode("utf-8")
         status, post = crawler.fetch_thread(123)
-        self.assertEqual(status, "skipped_title")
+        self.assertEqual(status, "skipped_forum")
         self.assertIsNone(post)
         self.assertEqual(crawler.local.last_create_time, 1784524303)
 
-    def test_latest_forum_tid_ignores_pinned_threads(self):
+    def test_native_forum_and_type_metadata_identifies_secondhand_sales(self):
+        self.assertTrue(is_secondhand_sale(
+            {"fid": "176", "typeid": "102", "title": "标题不参与判断"}
+        ))
+        self.assertFalse(is_secondhand_sale(
+            {"fid": "176", "typeid": "102", "is_top": 1,
+             "title": "【二手出售】交易区准则ver.2022"}
+        ))
+        self.assertFalse(is_secondhand_sale(
+            {"fid": "176", "typeid": "104", "title": "【二手出售】伪装标题"}
+        ))
+        self.assertFalse(is_secondhand_sale(
+            {"fid": "99", "typeid": "102", "title": "【二手出售】其他版块"}
+        ))
+        self.assertTrue(is_secondhand_sale(
+            {"fid": "176", "title": "【二手出售】详情页回退"}
+        ))
+        self.assertEqual(forum_post_type(
+            {"fid": "176", "typeid": "104", "title": "无标签"}
+        ), "求购")
+        self.assertTrue(is_market_post(
+            {"fid": "176", "typeid": "103", "is_top": -1}
+        ))
+
+    def test_latest_forum_tid_uses_all_types_but_ignores_pinned_threads(self):
         crawler = Crawler(Settings(1, 0, False, 50, 1, "【二手出售】", ()))
         crawler._request = lambda url: json.dumps({
             "success": True,
             "list": [
-                {"tid": "9999999", "is_top": 1},
-                {"tid": "4149040", "is_top": -1},
-                {"tid": "4149051", "is_top": -1},
+                {"tid": "9999999", "fid": "176", "typeid": "102", "is_top": 1,
+                 "title": "【二手出售】交易区准则ver.2022"},
+                {"tid": "4149060", "fid": "176", "typeid": "101", "is_top": -1,
+                 "title": "【商家广告】彼之良"},
+                {"tid": "4149040", "fid": "176", "typeid": "102", "is_top": -1,
+                 "title": "【二手出售】普通帖子一"},
+                {"tid": "4149051", "fid": "176", "typeid": "102", "is_top": -1,
+                 "title": "【二手出售】普通帖子二"},
             ],
         }).encode("utf-8")
-        self.assertEqual(crawler.fetch_latest_forum_tid(), 4149051)
+        self.assertEqual(crawler.fetch_latest_forum_tid(), 4149060)
+
+    def test_fetch_thread_can_skip_unselected_type_before_content_parsing(self):
+        crawler = Crawler(Settings(
+            1, 0, False, 50, 1, "【二手出售】", (), ("二手出售",)
+        ))
+        row = {
+            "tid": 123, "fid": 176, "is_top": -1,
+            "title": "【求购】收一个配件", "content": "收一个",
+            "create_time": 1784642106,
+        }
+        page = '<script>var row=' + json.dumps(row) + ';</script>'
+        crawler._request = lambda url: page.encode("utf-8")
+        self.assertEqual(crawler.fetch_thread(123), ("skipped_type:求购", None))
 
 
 if __name__ == "__main__":

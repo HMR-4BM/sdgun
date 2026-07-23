@@ -1,0 +1,52 @@
+.type-nav {
+  display: grid;
+  gap: 3px;
+  margin: 24px 6px 0;
+  padding-top: 16px;
+  border-top: 1px solid #1a252d;
+}
+
+.type-nav > small {
+  padding: 0 7px 7px;
+  color: #526570;
+  font-size: 9px;
+  letter-spacing: 1.2px;
+}
+
+.type-filter {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  border: 0;
+  border-radius: 7px;
+  padding: 7px;
+  background: transparent;
+  color: #71838e;
+  text-align: left;
+  font: 11px inherit;
+  cursor: pointer;
+}
+
+.type-filter:hover,
+.type-filter.active {
+  background: #121d23;
+  color: #e4eeee;
+}
+
+.type-filter i {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: #3d4c55;
+}
+
+.type-filter.active i {
+  background: var(--cyan);
+  box-shadow: 0 0 9px #22d3c588;
+}
+
+@media (max-width: 760px) {
+  .type-nav {
+    display: none;
+  }
+}

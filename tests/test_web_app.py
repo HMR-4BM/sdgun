@@ -13,6 +13,7 @@ from web_app import HunterManager, Repository, TaskManager
 def sample(tid, created_at, category="出售", prices=None):
     return {
         "tid": tid, "url": f"http://example/{tid}", "title": f"【二手出售】物品{tid}",
+        "post_type": "二手出售",
         "username": "测试用户", "user_id": "1", "created_at": created_at,
         "content": "正文", "images": [], "links": [], "xianyu_links": [],
         "comments": [], "category": category, "is_sold": category == "已出",
@@ -37,6 +38,21 @@ class RepositoryTests(unittest.TestCase):
     def test_posts_are_sorted_by_post_time_not_tid_or_crawl_time(self):
         result = self.repo.posts({"limit": ["10"]})
         self.assertEqual([x["tid"] for x in result["items"]], [10, 20])
+
+    def test_posts_can_be_filtered_by_native_post_type(self):
+        wanted = sample(30, "2026-07-20T11:00:00+00:00", "求购")
+        wanted.update(post_type="求购", title="【求购】物品30")
+        store = Store(self.path)
+        store.save_result(30, "matched", wanted)
+        store.close()
+        self.assertEqual(
+            [x["tid"] for x in self.repo.posts({"post_type": ["求购"]})["items"]],
+            [30],
+        )
+        self.assertEqual(
+            [x["tid"] for x in self.repo.posts({"post_type": ["二手出售"]})["items"]],
+            [10, 20],
+        )
 
     def test_favorites_can_be_saved_noted_listed_and_removed(self):
         self.assertFalse(self.repo.post(10)["is_favorite"])
@@ -114,6 +130,7 @@ class RepositoryTests(unittest.TestCase):
             "category": "已出", "interval": 2,
         })
         self.assertEqual(config["interval"], 10)
+        self.assertEqual(HunterManager.normalize({"q": "物品10"})["interval"], 60)
         hunter = HunterManager(self.repo, TaskManager(self.path))
         results = hunter.search(config)
         self.assertEqual([x["tid"] for x in results], [10])
@@ -128,6 +145,32 @@ class RepositoryTests(unittest.TestCase):
             {"tid": 3, "created_at": "2026-07-20T10:00:01+00:00"},
         ]
         self.assertEqual([x["tid"] for x in HunterManager.published_after(posts, started)], [2, 3])
+
+    def test_market_hunters_are_independent_concurrent_tasks(self):
+        hunter = HunterManager(self.repo, TaskManager(self.path))
+
+        def wait_until_stopped(manager, task_id):
+            with manager.lock:
+                event = manager.jobs[task_id]["event"]
+            event.wait(1)
+
+        with patch.object(HunterManager, "_run", wait_until_stopped):
+            first = hunter.start_task({"name": "任务 A", "q": "物品10"})
+            second = hunter.start_task({"name": "任务 B", "q": "物品20"})
+            snapshot = hunter.snapshot()
+            self.assertEqual(snapshot["active_count"], 2)
+            self.assertEqual({job["id"] for job in snapshot["tasks"]},
+                             {first["id"], second["id"]})
+            edited = hunter.edit_task(first["id"], {
+                "name": "任务 A（已编辑）", "q": "物品20", "interval": 90,
+            })
+            self.assertEqual(edited["name"], "任务 A（已编辑）")
+            self.assertEqual(edited["config"]["interval"], 90)
+            self.assertEqual(edited["results"], [])
+            self.assertTrue(hunter.stop(first["id"]))
+            self.assertFalse(hunter.stop("missing-task"))
+            self.assertFalse(hunter.jobs[second["id"]]["event"].is_set())
+            hunter.stop()
 
     def test_summary_quantifies_status_and_price(self):
         result = self.repo.summary({"days": ["3650"]})
@@ -186,22 +229,75 @@ class RepositoryTests(unittest.TestCase):
         self.assertTrue(result["status_changed"])
         self.assertEqual(self.repo.post(20)["category"], "已出")
 
-    def test_refresh_stops_at_forum_latest_published_tid(self):
+    def test_opening_post_lazily_loads_media_and_comments(self):
+        hydrated = sample(10, "2026-07-20T10:00:00+00:00", "已出", ["300"])
+        hydrated.update(
+            media_loaded=True,
+            comments_loaded=True,
+            images=["http://pic.example/a.jpg"],
+            comments=[{"content": "已出", "content_text": "已出"}],
+        )
+        with patch("web_app.Crawler.fetch_thread", return_value=("matched", hydrated)) as fetch:
+            result = self.repo.post(10, hydrate=True)
+        fetch.assert_called_once_with(10)
+        self.assertTrue(result["media_loaded"])
+        self.assertTrue(result["comments_loaded"])
+        self.assertEqual(result["images"], ["http://pic.example/a.jpg"])
+
+    def test_refresh_fetches_only_selected_tids_discovered_by_forum_list(self):
         store = Store(self.path)
         store.set_meta("next_tid", 100)
         manager = TaskManager(self.path)
         starts = []
 
         def fake_process(tids, options, frontier=False):
-            starts.append(tids[0])
-            return {tid: "skipped_title" for tid in tids}, {}
+            starts.extend(tids)
+            self.assertFalse(options["comments"])
+            self.assertFalse(options["media"])
+            return {tid: "matched" for tid in tids}, {}
 
         manager._process_range = fake_process
-        with patch("web_app.Crawler.fetch_latest_forum_tid", return_value=108):
+        forum_rows = [
+            {"tid": "108", "fid": "176", "typeid": "102", "is_top": -1,
+             "create_time": "200", "last_reply_time": "200"},
+            {"tid": "107", "fid": "176", "typeid": "104", "is_top": -1,
+             "create_time": "199", "last_reply_time": "199"},
+            {"tid": "999", "fid": "176", "typeid": "102", "is_top": 1,
+             "create_time": "198", "last_reply_time": "198"},
+        ]
+        with patch("web_app.Crawler.fetch_forum_page", return_value=forum_rows):
             cursor = manager._catch_up({"batch": 8}, store)
         self.assertEqual(cursor, 109)
-        self.assertEqual(starts, [100, 108])
+        self.assertEqual(starts, [108])
         self.assertEqual(store.get_meta("last_recorded_id"), "108")
+        status = store.db.execute(
+            "SELECT status FROM scan_state WHERE tid=107"
+        ).fetchone()[0]
+        self.assertEqual(status, "skipped_type:求购")
+        store.close()
+
+    def test_selecting_other_type_backfills_legacy_skipped_titles(self):
+        store = Store(self.path)
+        store.save_result(90, "skipped_title", None)
+        store.set_meta("next_tid", 109)
+        manager = TaskManager(self.path)
+        processed = []
+
+        def fake_process(tids, options, frontier=False):
+            processed.extend(tids)
+            return {tid: "matched" for tid in tids}, {}
+
+        manager._process_range = fake_process
+        forum_rows = [
+            {"tid": "108", "fid": "176", "typeid": "102", "is_top": -1,
+             "create_time": "200", "last_reply_time": "200"},
+            {"tid": "90", "fid": "176", "typeid": "104", "is_top": -1,
+             "create_time": "100", "last_reply_time": "100"},
+        ]
+        with patch("web_app.Crawler.fetch_forum_page", return_value=forum_rows):
+            manager._catch_up({"post_types": ["求购"], "batch": 8}, store)
+        self.assertIn(90, processed)
+        self.assertEqual(store.get_meta("post_type_backfill_version"), "2")
         store.close()
 
     def test_daily_market_is_persisted_and_quantified(self):

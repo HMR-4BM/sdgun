@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """Fast, incremental crawler for SDGun second-hand sale threads.
 
-Uses only Python's standard library.  It deliberately parses no post payload and
-requests no comments until the HTML <title> starts with the configured prefix.
+Uses only Python's standard library.  A post is accepted only when the site's
+own metadata identifies the toy marketplace and second-hand sale type.
 """
 
 from __future__ import annotations
@@ -32,6 +32,20 @@ DEFAULT_DB = Path(__file__).resolve().parent / "data" / "main" / "sdgun_market.d
 THREAD_URL = BASE + "/mag/circle/v1/forum/threadWapPage?tid={}"
 COMMENT_URL = BASE + "/mag/circle/v1/Forum/commentList"
 FORUM_LIST_URL = BASE + "/mag/circle/v1/Forum/threadList"
+MARKET_FID = 176
+SECONDHAND_SALE_TYPEID = 102
+POST_TYPES = {
+    101: "商家广告",
+    102: "二手出售",
+    103: "召集团购",
+    104: "求购",
+}
+POST_TYPE_PREFIXES = {
+    "【商家广告】": "商家广告",
+    "【二手出售】": "二手出售",
+    "【召集团购】": "召集团购",
+    "【求购】": "求购",
+}
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title\s*>", re.I | re.S)
 ROW_RE = re.compile(r"\bvar\s+row\s*=\s*(\{.*?\})\s*;", re.S)
 CREATE_TIME_RE = re.compile(r'"create_time"\s*:\s*"?(\d{10})"?')
@@ -135,6 +149,44 @@ def absolute_url(url: str) -> str:
     return urllib.parse.urljoin(BASE + "/", html.unescape(url))
 
 
+def forum_post_type(row: dict[str, Any]) -> str | None:
+    """Return the site's post type, with its generated title as fallback."""
+    typeid = row.get("typeid")
+    if typeid not in (None, ""):
+        try:
+            return POST_TYPES.get(int(typeid))
+        except (TypeError, ValueError):
+            return None
+    title = str(row.get("title") or "").strip()
+    return next((name for marker, name in POST_TYPE_PREFIXES.items()
+                 if title.startswith(marker)), None)
+
+
+def is_market_post(row: dict[str, Any]) -> bool:
+    """Accept ordinary typed posts in the toy marketplace.
+
+    ``Forum/threadList`` exposes both ``fid`` and ``typeid``.  The detail page's
+    embedded ``row`` omits ``typeid``, but still exposes ``fid`` and the
+    server-generated title (whose prefix is derived from the selected type).
+    """
+    try:
+        if int(row.get("fid")) != MARKET_FID:
+            return False
+    except (TypeError, ValueError):
+        return False
+    try:
+        if int(row.get("is_top") or -1) == 1:
+            return False
+    except (TypeError, ValueError):
+        return False
+    return forum_post_type(row) is not None
+
+
+def is_secondhand_sale(row: dict[str, Any], prefix: str = "【二手出售】") -> bool:
+    """Return whether a market row belongs in the default sale view."""
+    return is_market_post(row) and forum_post_type(row) == "二手出售"
+
+
 def classify(title: str, body: str, comments: list[dict[str, Any]]) -> str:
     # Comments such as “已出” often contain the freshest transaction state.
     combined = "\n".join([title, body] + [str(x.get("content_text", "")) for x in comments])
@@ -207,7 +259,7 @@ def _title_item_candidates(title_item: str) -> list[str]:
 
 def _normalized_item_name(text: str) -> str:
     """Reduce common seller/material descriptions to the advertised model name."""
-    cleaned = ITEM_PREFIX_RE.sub("", text).strip()
+    cleaned = URL_RE.sub("", ITEM_PREFIX_RE.sub("", text)).strip()
     cleaned = re.sub(r"[（(][^）)]*[）)]", "", cleaned)
     cleaned = TRAILING_BARE_PRICE_RE.sub("", cleaned).strip(" -—•\t")
     folded = cleaned.casefold()
@@ -231,7 +283,7 @@ def extract_item_details(title: str, body: str,
     structured_bare_prices = len(raw_blocks) >= 2
     candidates: list[str] = []
     for block in raw_blocks:
-        compact = re.sub(r"\s+", " ", block).strip(" -—•\t")
+        compact = URL_RE.sub("", re.sub(r"\s+", " ", block)).strip(" -—•\t")
         if not 2 <= len(compact) <= 240:
             continue
         marked = bool(ITEM_PREFIX_RE.match(block))
@@ -320,6 +372,8 @@ class Settings:
     max_comment_pages: int
     prefix: str
     keywords: tuple[str, ...]
+    post_types: tuple[str, ...] = ()
+    media: bool = True
 
 
 class Crawler:
@@ -346,7 +400,7 @@ class Crawler:
         raise last or RuntimeError("request failed")
 
     def fetch_thread(self, tid: int) -> tuple[str, dict[str, Any] | None]:
-        """Return status and post. Non-matching pages stop before row parsing."""
+        """Return status and post, using the site's own forum/type metadata."""
         self.local.last_create_time = None
         try:
             raw = self._request(THREAD_URL.format(tid))
@@ -357,15 +411,6 @@ class Crawler:
         create_match = CREATE_TIME_RE.search(page)
         if create_match:
             self.local.last_create_time = int(create_match.group(1))
-        match = TITLE_RE.search(page)
-        if not match:
-            return "no_title", None
-        title = html.unescape(re.sub(r"<[^>]+>", "", match.group(1))).strip()
-        if not title.startswith(self.s.prefix):
-            return "skipped_title", None
-        folded_page = page.casefold()
-        if self.s.keywords and not any(keyword_in_raw_page(k, folded_page) for k in self.s.keywords):
-            return "skipped_keyword", None
         row_match = ROW_RE.search(page)
         if not row_match:
             return "no_row", None
@@ -373,13 +418,38 @@ class Crawler:
             row = json.loads(row_match.group(1))
         except json.JSONDecodeError:
             return "bad_row", None
+        post_type = forum_post_type(row)
+        try:
+            forum_id = int(row.get("fid"))
+        except (TypeError, ValueError):
+            return "skipped_forum", None
+        if forum_id != MARKET_FID:
+            return "skipped_forum", None
+        try:
+            if int(row.get("is_top") or -1) == 1:
+                return "skipped_pinned", None
+        except (TypeError, ValueError):
+            return "skipped_forum", None
+        if post_type is None:
+            return "skipped_type_unknown", None
+        if self.s.post_types and post_type not in self.s.post_types:
+            return f"skipped_type:{post_type}", None
+        title = str(row.get("title") or "").strip()
+        if not title:
+            match = TITLE_RE.search(page)
+            if not match:
+                return "no_title", None
+            title = html.unescape(re.sub(r"<[^>]+>", "", match.group(1))).strip()
+        folded_page = page.casefold()
+        if self.s.keywords and not any(keyword_in_raw_page(k, folded_page) for k in self.s.keywords):
+            return "skipped_keyword", None
 
         body, content_images, content_links, content_videos, content_video_posters = clean_rich_content(
             str(row.get("content", ""))
         )
         # row.pics belongs to the post. Never scrape arbitrary <img> elements.
         pic_urls: list[str] = []
-        for pic in row.get("pics") or []:
+        for pic in (row.get("pics") or []) if self.s.media else []:
             if isinstance(pic, str):
                 pic_urls.append(pic)
             elif isinstance(pic, dict):
@@ -388,20 +458,26 @@ class Crawler:
                         pic_urls.append(str(pic[key])); break
         # row.pics also contains <video poster> thumbnails. They belong to the
         # player and must not be rendered again in the image gallery.
-        video_posters = set(absolute_url(x) for x in content_video_posters)
+        video_posters = set(absolute_url(x) for x in content_video_posters) if self.s.media else set()
         images = [x for x in unique_images(absolute_url(x) for x in pic_urls + content_images)
                   if x not in video_posters]
+        if not self.s.media:
+            images = []
         comments = self.fetch_comments(tid) if self.s.comments and int(row.get("reply_count") or 0) else []
         comment_links = [u for c in comments for u in c.get("links", [])]
         all_links = unique(absolute_url(x) for x in content_links + comment_links)
-        videos = unique(absolute_url(x) for x in content_videos)
+        videos = unique(absolute_url(x) for x in content_videos) if self.s.media else []
         xianyu_links = [x for x in all_links if any(h in x.casefold() for h in ("2.taobao.com", "m.tb.cn", "tb.cn", "goofish.com"))]
         item_details = extract_item_details(title, body, comments)
-        category = category_from_items(item_details, classify(title, body, comments))
+        fallback_category = "求购" if post_type == "求购" else classify(title, body, comments)
+        category = category_from_items(item_details, fallback_category)
         post = {
             "tid": int(row.get("tid") or tid),
             "url": THREAD_URL.format(tid),
             "title": title,
+            "forum_id": int(row.get("fid") or MARKET_FID),
+            "is_top": int(row.get("is_top") or -1) == 1,
+            "post_type": post_type,
             "username": row.get("user_name") or "",
             "user_id": row.get("user_id") or "",
             "created_at": timestamp_text(row.get("create_time")),
@@ -412,6 +488,8 @@ class Crawler:
             "links": all_links,
             "xianyu_links": xianyu_links,
             "comments": comments,
+            "comments_loaded": self.s.comments,
+            "media_loaded": self.s.media,
             "category": category,
             "is_sold": category == "已出",
             "items": [x["name"] for x in item_details],
@@ -453,16 +531,22 @@ class Crawler:
         return output
 
     def fetch_latest_forum_tid(self, fid: int = 176, step: int = 100) -> int:
-        """Read the forum's public list and return its newest published tid."""
-        query = urllib.parse.urlencode({"fid": fid, "p": 1, "step": step})
+        """Return the newest ordinary typed market-post tid from the public list."""
+        rows = self.fetch_forum_page(fid, 1, step)
+        tids = [int(item["tid"]) for item in rows
+                if item.get("tid") and is_market_post(item)]
+        if not tids:
+            raise RuntimeError("交易区列表没有返回普通分类帖子")
+        return max(tids)
+
+    def fetch_forum_page(self, fid: int = 176, page: int = 1,
+                         step: int = 500) -> list[dict[str, Any]]:
+        """Read one typed forum-list page without fetching thread details."""
+        query = urllib.parse.urlencode({"fid": fid, "p": page, "step": step})
         payload = json.loads(self._request(FORUM_LIST_URL + "?" + query))
         if not payload.get("success"):
             raise RuntimeError(payload.get("msg") or "无法读取交易区最新帖子")
-        tids = [int(item["tid"]) for item in payload.get("list") or []
-                if item.get("tid") and int(item.get("is_top") or -1) != 1]
-        if not tids:
-            raise RuntimeError("交易区列表没有返回普通帖子")
-        return max(tids)
+        return [item for item in payload.get("list") or [] if isinstance(item, dict)]
 
 
 def timestamp_text(value: Any) -> str:
@@ -541,7 +625,8 @@ def save_monthly_post(main_db: Path, post: dict[str, Any]) -> None:
             CREATE TABLE IF NOT EXISTS posts (
               tid INTEGER PRIMARY KEY, title TEXT, username TEXT, category TEXT,
               created_at TEXT, crawled_at TEXT, post_year INTEGER,
-              post_month INTEGER, post_day TEXT, search_text TEXT, data TEXT NOT NULL
+              post_month INTEGER, post_day TEXT, post_type TEXT,
+              search_text TEXT, data TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_posts_day_time ON posts(post_day, created_at DESC);
             CREATE INDEX IF NOT EXISTS idx_posts_category ON posts(category);
@@ -549,11 +634,14 @@ def save_monthly_post(main_db: Path, post: dict[str, Any]) -> None:
         monthly_columns = {row[1] for row in db.execute("PRAGMA table_info(posts)")}
         if "search_text" not in monthly_columns:
             db.execute("ALTER TABLE posts ADD COLUMN search_text TEXT")
+        if "post_type" not in monthly_columns:
+            db.execute("ALTER TABLE posts ADD COLUMN post_type TEXT")
         db.execute("""INSERT OR REPLACE INTO posts
-            (tid,title,username,category,created_at,crawled_at,post_year,post_month,post_day,search_text,data)
-            VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+            (tid,title,username,category,created_at,crawled_at,post_year,post_month,post_day,post_type,search_text,data)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
             (post.get("tid"), post.get("title"), post.get("username"), post.get("category"),
-             post.get("created_at"), post.get("crawled_at"), year, month, day, searchable_text(post),
+             post.get("created_at"), post.get("crawled_at"), year, month, day,
+             post.get("post_type") or "二手出售", searchable_text(post),
              json.dumps(post, ensure_ascii=False)))
         db.commit()
 
@@ -570,7 +658,8 @@ class Store:
             CREATE TABLE IF NOT EXISTS posts (
               tid INTEGER PRIMARY KEY, title TEXT, username TEXT, category TEXT,
               created_at TEXT, crawled_at TEXT, data TEXT NOT NULL,
-              post_year INTEGER, post_month INTEGER, post_day TEXT, search_text TEXT
+              post_year INTEGER, post_month INTEGER, post_day TEXT,
+              post_type TEXT, search_text TEXT
             );
             CREATE TABLE IF NOT EXISTS scan_state (
               tid INTEGER PRIMARY KEY, status TEXT NOT NULL, checked_at INTEGER NOT NULL
@@ -612,9 +701,13 @@ class Store:
         """)
         existing = {row[1] for row in self.db.execute("PRAGMA table_info(posts)")}
         for name, kind in (("post_year", "INTEGER"), ("post_month", "INTEGER"),
-                           ("post_day", "TEXT"), ("search_text", "TEXT")):
+                           ("post_day", "TEXT"), ("post_type", "TEXT"),
+                           ("search_text", "TEXT")):
             if name not in existing:
                 self.db.execute(f"ALTER TABLE posts ADD COLUMN {name} {kind}")
+        self.db.execute(
+            "UPDATE posts SET post_type='二手出售' WHERE post_type IS NULL OR post_type=''"
+        )
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_posts_day_time ON posts(post_day, created_at DESC)")
         self.db.execute("CREATE INDEX IF NOT EXISTS idx_posts_year_month ON posts(post_year, post_month, created_at DESC)")
         # One-time lightweight backfill for databases created before date partitions.
@@ -641,12 +734,14 @@ class Store:
             if post:
                 year, month, day = post_date_parts(post.get("created_at", ""))
                 self.db.execute("""INSERT OR REPLACE INTO posts
-                    (tid,title,username,category,created_at,crawled_at,data,post_year,post_month,post_day,search_text)
-                    VALUES(?,?,?,?,?,?,?,?,?,?,?)""",
+                    (tid,title,username,category,created_at,crawled_at,data,post_year,post_month,post_day,post_type,search_text)
+                    VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (tid, post["title"], post["username"], post["category"], post["created_at"],
                      post["crawled_at"], json.dumps(post, ensure_ascii=False), year, month, day,
-                     searchable_text(post)))
+                     post.get("post_type") or "二手出售", searchable_text(post)))
                 save_monthly_post(self.path, post)
+            elif status in {"skipped_forum", "skipped_pinned", "skipped_type_unknown"}:
+                self.db.execute("DELETE FROM posts WHERE tid=?", (tid,))
 
     def seen(self) -> set[int]:
         return {r[0] for r in self.db.execute("SELECT tid FROM scan_state")}

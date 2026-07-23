@@ -15,6 +15,7 @@ import threading
 import time
 import urllib.parse
 import urllib.request
+import uuid
 from collections import Counter, defaultdict
 from datetime import datetime, timedelta, timezone
 from http import HTTPStatus
@@ -23,8 +24,10 @@ from pathlib import Path
 from statistics import median
 from typing import Any
 
-from sdgun_crawler import (Crawler, Settings, Store, category_from_items,
-                           extract_item_details, save_monthly_post, searchable_text)
+from sdgun_crawler import (MARKET_FID, Crawler, Settings, Store,
+                           category_from_items, extract_item_details,
+                           forum_post_type, is_market_post, save_monthly_post,
+                           searchable_text)
 
 ROOT = Path(__file__).resolve().parent
 WEB_ROOT = ROOT / "web"
@@ -108,6 +111,11 @@ class TaskManager:
     @staticmethod
     def settings(options: dict[str, Any]) -> Settings:
         keywords = tuple(str(x).strip() for x in options.get("keywords", []) if str(x).strip())
+        allowed_types = {"二手出售", "求购", "召集团购", "商家广告"}
+        post_types = tuple(dict.fromkeys(
+            str(x).strip() for x in options.get("post_types", ["二手出售"])
+            if str(x).strip() in allowed_types
+        ))
         return Settings(
             timeout=max(1.0, min(float(options.get("timeout", 6)), 30)),
             retries=max(0, min(int(options.get("retries", 0)), 3)),
@@ -116,6 +124,8 @@ class TaskManager:
             max_comment_pages=max(1, min(int(options.get("max_comment_pages", 20)), 100)),
             prefix="【二手出售】",
             keywords=keywords,
+            post_types=post_types,
+            media=bool(options.get("media", False)),
         )
 
     def _process_range(self, tids: list[int], options: dict[str, Any], *, frontier: bool = False) -> tuple[dict[int, str], dict[int, int]]:
@@ -200,7 +210,8 @@ class TaskManager:
             self._finish("刷新失败", str(exc))
 
     def _catch_up(self, options: dict[str, Any], store: Store) -> int:
-        """Catch up only to the newest tid reported by the forum list."""
+        """Discover typed market tids from forum pages, then fetch only selected ones."""
+        sync_started = int(time.time())
         saved = store.get_meta("next_tid") or store.get_meta("watch_cursor")
         if saved:
             cursor = int(saved)
@@ -208,37 +219,90 @@ class TaskManager:
             with contextlib.closing(sqlite3.connect(self.db_path)) as db:
                 row = db.execute("SELECT max(tid) FROM scan_state").fetchone()
             cursor = int(row[0] + 1) if row and row[0] is not None else 4148800
-        boundary_crawler = Crawler(self.settings(options))
-        latest_tid = boundary_crawler.fetch_latest_forum_tid(176, 100)
-        # Recover databases whose old time-based algorithm moved beyond the
-        # actual forum boundary. Resume after the newest confirmed target post.
-        if cursor > latest_tid + 1:
-            with contextlib.closing(sqlite3.connect(self.db_path)) as db:
-                row = db.execute("SELECT max(tid) FROM posts WHERE tid <= ?", (latest_tid,)).fetchone()
-                db.execute("DELETE FROM scan_state WHERE tid > ?", (latest_tid,))
-                db.execute("DELETE FROM posts WHERE tid > ?", (latest_tid,))
-                db.commit()
-            cursor = int(row[0] + 1) if row and row[0] is not None else latest_tid
+        crawler = Crawler(self.settings(options))
+        selected_types = crawler.s.post_types
+        previous_sync = int(store.get_meta("forum_sync_time") or 0)
+        legacy_mode = (
+            store.get_meta("post_type_backfill_version") != "2"
+            and any(name != "二手出售" for name in selected_types)
+        )
+        with contextlib.closing(sqlite3.connect(self.db_path)) as db:
+            known_status = {int(tid): status for tid, status in db.execute(
+                "SELECT tid,status FROM scan_state"
+            ).fetchall()}
+            legacy_ids = {
+                int(row[0]) for row in db.execute(
+                    "SELECT tid FROM scan_state WHERE status='skipped_title'"
+                ).fetchall()
+            } if legacy_mode else set()
+
+        list_step = max(100, min(int(options.get("forum_step", 500)), 500))
+        max_pages = 10 if legacy_mode else 20
+        discovered: dict[int, dict[str, Any]] = {}
+        latest_tid = 0
+        page = 1
+        while page <= max_pages and not self.stop_event.is_set():
+            rows = crawler.fetch_forum_page(MARKET_FID, page, list_step)
+            if not rows:
+                break
+            ordinary = [row for row in rows if is_market_post(row)]
+            for row in ordinary:
+                tid = int(row["tid"])
+                latest_tid = max(latest_tid, tid)
+                created = int(row.get("create_time") or 0)
+                is_new = created >= previous_sync if previous_sync else tid >= cursor
+                if is_new or tid in legacy_ids or known_status.get(tid, "").startswith("skipped_type:"):
+                    discovered[tid] = row
+            activities = [
+                int(row.get("last_reply_time") or row.get("create_time") or 0)
+                for row in ordinary
+            ]
+            normal_done = (
+                bool(previous_sync) and activities and max(activities) < previous_sync
+            ) or (
+                not previous_sync and page >= 2
+                and not any(int(row.get("tid") or 0) >= cursor for row in ordinary)
+            )
+            if normal_done and (not legacy_mode or page >= 10):
+                break
+            if len(rows) < list_step:
+                break
+            page += 1
+        if not latest_tid:
+            raise RuntimeError("交易区列表没有返回普通分类帖子")
+
+        target_tids: list[int] = []
+        for tid, row in sorted(discovered.items()):
+            post_type = forum_post_type(row)
+            if post_type in selected_types:
+                if known_status.get(tid) != "matched":
+                    target_tids.append(tid)
+            elif known_status.get(tid) != "matched":
+                store.save_result(tid, f"skipped_type:{post_type}", None)
+
+        fetch_options = dict(options)
+        fetch_options.update(comments=False, media=False)
         batch = max(8, min(int(options.get("batch", 64)), 500))
-        self._update(message=f"交易区最新发布 ID {latest_tid}；开始增量同步",
+        self._update(message=f"列表发现 {len(discovered)} 条；仅拉取 {len(target_tids)} 条目标帖子",
                      forum_latest_tid=latest_tid)
-        while cursor <= latest_tid and not self.stop_event.is_set():
-            end = min(latest_tid, cursor + batch - 1)
-            statuses, _ = self._process_range(list(range(cursor, end + 1)), options, frontier=True)
+        for start in range(0, len(target_tids), batch):
+            if self.stop_event.is_set():
+                break
+            tids = target_tids[start:start + batch]
+            statuses, _ = self._process_range(tids, fetch_options, frontier=True)
             retry_tids = [tid for tid, status in statuses.items() if status in TRANSIENT]
             if retry_tids and not self.stop_event.is_set():
-                self._process_range(retry_tids, options, frontier=True)
-            cursor = end + 1
-            store.set_meta("next_tid", cursor)
-            store.set_meta("last_recorded_id", cursor - 1)
-            self._update(message=f"正在同步到 {latest_tid}；已处理到 {cursor - 1}",
-                         next_tid=cursor, last_recorded_id=cursor - 1,
+                self._process_range(retry_tids, fetch_options, frontier=True)
+            self._update(message=f"正在拉取目标帖子；已完成 {min(start + batch, len(target_tids))}/{len(target_tids)}",
                          forum_latest_tid=latest_tid)
-        store.set_meta("next_tid", cursor)
-        store.set_meta("last_recorded_id", latest_tid)
-        self._update(message=f"已同步至交易区最新发布 ID {latest_tid}",
-                     next_tid=latest_tid + 1, last_recorded_id=latest_tid,
-                     forum_latest_tid=latest_tid)
+        if not self.stop_event.is_set():
+            store.set_meta("forum_sync_time", sync_started)
+            store.set_meta("post_type_backfill_version", 2)
+            store.set_meta("next_tid", latest_tid + 1)
+            store.set_meta("last_recorded_id", latest_tid)
+            self._update(message=f"列表同步完成；最新交易区 ID {latest_tid}",
+                         next_tid=latest_tid + 1, last_recorded_id=latest_tid,
+                         forum_latest_tid=latest_tid)
         return latest_tid + 1
 
 
@@ -259,7 +323,7 @@ class Repository:
                 db.execute("ALTER TABLE favorites ADD COLUMN note TEXT NOT NULL DEFAULT ''")
             db.execute("UPDATE scan_state SET status='matched' WHERE tid IN (SELECT tid FROM posts)")
             version = db.execute("SELECT value FROM metadata WHERE key='item_schema_version'").fetchone()
-            if not version or version[0] != "7":
+            if not version or version[0] != "8":
                 rows = db.execute("SELECT tid, data FROM posts").fetchall()
                 for tid, raw in rows:
                     post = json.loads(raw)
@@ -279,7 +343,7 @@ class Repository:
                                (post["category"], searchable_text(post),
                                 json.dumps(post, ensure_ascii=False), tid))
                     save_monthly_post(db_path, post)
-                db.execute("INSERT OR REPLACE INTO metadata VALUES('item_schema_version','7')")
+                db.execute("INSERT OR REPLACE INTO metadata VALUES('item_schema_version','8')")
             db.commit()
 
     def connect(self) -> sqlite3.Connection:
@@ -292,6 +356,12 @@ class Repository:
         offset = max(0, int(first(query, "offset", "0")))
         category, keyword = first(query, "category", ""), first(query, "q", "").strip()
         where, params = [], []
+        post_type = first(query, "post_type", "").strip()
+        allowed_post_types = {"二手出售", "求购", "召集团购", "商家广告"}
+        if post_type and post_type != "全部":
+            if post_type not in allowed_post_types:
+                raise ValueError("帖子类型无效")
+            where.append("post_type=?"); params.append(post_type)
         if category and category != "全部":
             where.append("category=?"); params.append(category)
         if keyword:
@@ -334,6 +404,8 @@ class Repository:
                               " ORDER BY created_at DESC, tid DESC LIMIT ? OFFSET ?",
                               params + [limit, offset]).fetchall()
         items = [json.loads(row[0]) for row in rows]
+        for post in items:
+            post.setdefault("post_type", "二手出售")
         with contextlib.closing(self.connect()) as db:
             favorite_ids = {row[0] for row in db.execute("SELECT tid FROM favorites").fetchall()}
         for post in items:
@@ -347,14 +419,31 @@ class Repository:
                 "items": items,
                 "excluded_on_page": sum(bool(post.get("search_excluded")) for post in items)}
 
-    def post(self, tid: int) -> dict[str, Any] | None:
+    def post(self, tid: int, hydrate: bool = False) -> dict[str, Any] | None:
         with contextlib.closing(self.connect()) as db:
             row = db.execute("SELECT data FROM posts WHERE tid=?", (tid,)).fetchone()
             favorite = db.execute("SELECT 1 FROM favorites WHERE tid=?", (tid,)).fetchone()
         if not row:
             return None
         post = json.loads(row[0])
+        post.setdefault("post_type", "二手出售")
         post["is_favorite"] = bool(favorite)
+        if hydrate and not (post.get("comments_loaded") and post.get("media_loaded")):
+            options = {
+                "timeout": 10, "retries": 1, "comments": True, "media": True,
+                "max_comment_pages": 5,
+                "post_types": ["二手出售", "求购", "召集团购", "商家广告"],
+            }
+            crawler = Crawler(TaskManager.settings(options))
+            status, hydrated = crawler.fetch_thread(tid)
+            if status == "matched" and hydrated:
+                store = Store(self.db_path)
+                try:
+                    store.save_result(tid, status, hydrated)
+                finally:
+                    store.close()
+                hydrated["is_favorite"] = bool(favorite)
+                return hydrated
         return post
 
     def set_favorite(self, tid: int, favorite: bool) -> dict[str, Any] | None:
@@ -378,6 +467,7 @@ class Repository:
         items = []
         for row in rows:
             post = json.loads(row["data"])
+            post.setdefault("post_type", "二手出售")
             post.update(is_favorite=True, note=row["note"], favorited_at=row["favorited_at"])
             items.append(post)
         return {"total": len(items), "items": items}
@@ -426,6 +516,8 @@ class Repository:
             return None
         crawler = Crawler(TaskManager.settings({
             "timeout": 10, "retries": 1, "comments": True, "max_comment_pages": 20,
+            "media": True,
+            "post_types": ["二手出售", "求购", "召集团购", "商家广告"],
         }))
         fetch_status, post = crawler.fetch_thread(tid)
         if fetch_status != "matched" or not post:
@@ -433,6 +525,9 @@ class Repository:
                 "unreachable": "暂时无法连接原帖", "no_title": "原帖不存在或无法读取",
                 "no_row": "原帖内容暂时无法解析", "bad_row": "原帖返回了无效数据",
                 "skipped_title": "原帖标题已不符合交易帖规则",
+                "skipped_forum": "原帖已不属于玩具交易区",
+                "skipped_pinned": "原帖属于置顶固定展示位",
+                "skipped_type_unknown": "网站没有返回可识别的帖子类型",
                 "skipped_keyword": "原帖已不符合关键词规则",
             }
             raise RuntimeError(messages.get(fetch_status, f"更新失败：{fetch_status}"))
@@ -452,16 +547,27 @@ class Repository:
                         if old_status != new_status else f"状态仍为{new_status}"),
         }
 
-    def all_posts(self, limit: int | None = 10000) -> list[dict[str, Any]]:
+    def all_posts(self, limit: int | None = 10000,
+                  post_type: str | None = None) -> list[dict[str, Any]]:
         with contextlib.closing(self.connect()) as db:
+            where = " WHERE post_type=?" if post_type else ""
+            params: list[Any] = [post_type] if post_type else []
             if limit is None:
-                rows = db.execute("SELECT data FROM posts ORDER BY tid DESC").fetchall()
+                rows = db.execute(
+                    "SELECT data FROM posts" + where + " ORDER BY tid DESC", params
+                ).fetchall()
             else:
-                rows = db.execute("SELECT data FROM posts ORDER BY tid DESC LIMIT ?", (limit,)).fetchall()
-        return [json.loads(row[0]) for row in rows]
+                rows = db.execute(
+                    "SELECT data FROM posts" + where + " ORDER BY tid DESC LIMIT ?",
+                    params + [limit],
+                ).fetchall()
+        posts = [json.loads(row[0]) for row in rows]
+        for post in posts:
+            post.setdefault("post_type", "二手出售")
+        return posts
 
     def rebuild_daily(self) -> int:
-        rows = build_daily_market(self.all_posts(None))
+        rows = build_daily_market(self.all_posts(None, "二手出售"))
         columns = (
             "day", "timezone", "first_tid", "last_tid", "first_post_time", "last_post_time",
             "posts", "selling", "sold", "wanted", "uncertain", "sold_rate", "active_users",
@@ -489,7 +595,7 @@ class Repository:
 
     def summary(self, query: dict[str, list[str]]) -> dict[str, Any]:
         days = max(1, min(int(first(query, "days", "30")), 3650))
-        all_posts = self.all_posts()
+        all_posts = self.all_posts(post_type="二手出售")
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         posts = [p for p in all_posts if (parse_iso(p.get("created_at", "")) or cutoff) >= cutoff]
         post_categories = Counter(p.get("category", "待确认") for p in posts)
@@ -672,21 +778,13 @@ def build_daily_market(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 class HunterManager:
-    """Background keyword watcher that reuses incremental refresh and SQL search."""
+    """Run each keyword watcher as an independent, concurrently managed task."""
 
     def __init__(self, repo: Repository, tasks: TaskManager) -> None:
         self.repo = repo
         self.tasks = tasks
         self.lock = threading.Lock()
-        self.stop_event = threading.Event()
-        self.thread: threading.Thread | None = None
-        self.seen_ids: set[int] = set()
-        self.state: dict[str, Any] = {
-            "active": False, "message": "猎手未启动", "config": None,
-            "checks": 0, "total_matches": 0, "new_hits": 0,
-            "alert_id": 0, "results": [], "last_check_at": None,
-            "next_check_at": None, "error": None,
-        }
+        self.jobs: dict[str, dict[str, Any]] = {}
 
     @staticmethod
     def normalize(options: dict[str, Any]) -> dict[str, Any]:
@@ -696,28 +794,42 @@ class HunterManager:
         match = str(options.get("match", "any")).lower()
         field = str(options.get("field", "all")).lower()
         category = str(options.get("category", "全部"))
+        post_type = str(options.get("post_type", "二手出售"))
         if match not in {"any", "all"}:
             raise ValueError("命中方式无效")
         if field not in {"all", "title", "author"}:
             raise ValueError("检索范围无效")
         if category not in {"全部", "出售", "出售+求购", "部分已出", "已出", "求购"}:
             raise ValueError("交易状态无效")
-        interval = max(10, min(int(options.get("interval", 30)), 86400))
-        return {"q": query, "match": match, "field": field,
+        if post_type not in {"全部", "二手出售", "求购", "召集团购", "商家广告"}:
+            raise ValueError("帖子类型无效")
+        interval = max(10, min(int(options.get("interval", 60)), 86400))
+        return {"q": query, "match": match, "field": field, "post_type": post_type,
                 "category": category, "interval": interval}
 
     def snapshot(self) -> dict[str, Any]:
         with self.lock:
-            state = dict(self.state)
-            state["results"] = [dict(x) for x in self.state.get("results", [])]
-            state["config"] = dict(self.state["config"]) if self.state.get("config") else None
-        return state
+            jobs = [self._copy_job(job) for job in self.jobs.values()]
+        jobs.sort(key=lambda job: job.get("created_at", ""), reverse=True)
+        active = sum(bool(job["active"]) for job in jobs)
+        return {"active": active > 0, "active_count": active, "total": len(jobs), "tasks": jobs}
+
+    @staticmethod
+    def _copy_job(job: dict[str, Any]) -> dict[str, Any]:
+        return {
+            key: ([dict(x) for x in value] if key in {"results", "latest_hits"} else
+                  dict(value) if key == "config" else value)
+            for key, value in job.items()
+            if key not in {"event", "thread", "seen_ids"}
+        }
 
     def search(self, config: dict[str, Any]) -> list[dict[str, Any]]:
-        query = {key: [str(config[key])] for key in ("q", "match", "field", "category")}
+        query = {key: [str(config[key])]
+                 for key in ("q", "match", "field", "category", "post_type")}
         query["limit"] = ["100"]
         posts = self.repo.posts(query)["items"]
-        keys = ("tid", "title", "username", "category", "created_at", "prices", "url", "items",
+        keys = ("tid", "title", "username", "post_type", "category",
+                "created_at", "prices", "url", "items",
                 "search_excluded", "search_excluded_terms")
         return [{key: post.get(key) for key in keys} for post in posts]
 
@@ -726,45 +838,91 @@ class HunterManager:
         return [post for post in posts
                 if (parse_iso(post.get("created_at", "")) or started) >= started]
 
-    def start(self, options: dict[str, Any]) -> tuple[bool, str]:
+    def start_task(self, options: dict[str, Any]) -> dict[str, Any]:
         config = self.normalize(options)
         # Forum timestamps are second-precision. Floor the boundary to a whole
         # second, then use the baseline ID set to disambiguate same-second posts.
         started = datetime.now(timezone.utc).replace(microsecond=0)
-        with self.lock:
-            if self.state["active"]:
-                return False, "市场猎手已经在运行"
-        # Establish a baseline without alerting on anything published before
-        # the exact moment the user pressed Start.
         baseline = self.search(config)
         historical_ids = {
             int(post["tid"]) for post in baseline
             if (parse_iso(post.get("created_at", "")) or started) <= started
         }
+        task_id = uuid.uuid4().hex[:12]
+        event = threading.Event()
+        name = str(options.get("name", "")).strip()[:60] or config["q"]
+        job: dict[str, Any] = {
+            "id": task_id, "name": name, "active": True,
+            "status": "scheduled", "message": "已建立当前起点，等待新帖",
+            "config": config, "created_at": datetime.now(timezone.utc).isoformat(),
+            "started_at": started.isoformat(), "completed_at": None,
+            "checks": 0, "total_matches": 0, "new_hits": 0,
+            "alert_id": 0, "results": [], "last_check_at": None,
+            "next_check_at": None, "latest_hits": [], "error": None,
+            "event": event, "seen_ids": historical_ids,
+        }
         with self.lock:
-            if self.state["active"]:
-                return False, "市场猎手已经在运行"
-            event = threading.Event()
-            self.stop_event = event
-            self.seen_ids = historical_ids
-            self.state = {
-                "active": True, "message": "已建立当前起点，等待新帖", "config": config,
-                "started_at": started.isoformat(),
-                "checks": 0, "total_matches": 0, "new_hits": 0,
-                "alert_id": 0, "results": [], "last_check_at": None,
-                "next_check_at": None, "latest_hits": [], "error": None,
-            }
-            self.thread = threading.Thread(target=self._run, args=(event,), daemon=True,
-                                           name="sdgun-market-hunter")
-            self.thread.start()
-        return True, "市场猎手已启动"
+            self.jobs[task_id] = job
+            thread = threading.Thread(target=self._run, args=(task_id,), daemon=True,
+                                      name=f"sdgun-hunter-{task_id}")
+            job["thread"] = thread
+            thread.start()
+        return self._copy_job(job)
 
-    def stop(self) -> bool:
+    def start(self, options: dict[str, Any]) -> tuple[bool, str]:
+        job = self.start_task(options)
+        return True, f"猎手任务“{job['name']}”已启动"
+
+    def edit_task(self, task_id: str, options: dict[str, Any]) -> dict[str, Any]:
+        config = self.normalize(options)
+        name = str(options.get("name", "")).strip()[:60] or config["q"]
         with self.lock:
-            if not self.state["active"]:
+            if task_id not in self.jobs:
+                raise ValueError("猎手任务不存在")
+            current = self.jobs[task_id]
+            old_config = dict(current["config"])
+            active = bool(current["active"])
+        search_changed = any(
+            old_config.get(key) != config.get(key)
+            for key in ("q", "match", "field", "post_type", "category")
+        )
+        baseline: list[dict[str, Any]] = self.search(config) if search_changed else []
+        edited_at = datetime.now(timezone.utc).replace(microsecond=0)
+        with self.lock:
+            job = self.jobs[task_id]
+            job["name"] = name
+            job["config"] = config
+            job["updated_at"] = datetime.now(timezone.utc).isoformat()
+            if search_changed:
+                job["started_at"] = edited_at.isoformat()
+                job["seen_ids"] = {
+                    int(post["tid"]) for post in baseline
+                    if (parse_iso(post.get("created_at", "")) or edited_at) <= edited_at
+                }
+                job["results"] = []
+                job["latest_hits"] = []
+                job["total_matches"] = 0
+                job["new_hits"] = 0
+                job["message"] = "规则已更新，已从当前时间重新建立追踪起点"
+            elif active:
+                job["message"] = "任务设置已更新"
+            return self._copy_job(job)
+
+    def stop(self, task_id: str | None = None) -> bool:
+        with self.lock:
+            if task_id:
+                if task_id not in self.jobs:
+                    return False
+                targets = [self.jobs[task_id]]
+            else:
+                targets = [job for job in self.jobs.values() if job["active"]]
+            if not targets:
                 return False
-            self.state["message"] = "正在停止市场猎手"
-            self.stop_event.set()
+            for job in targets:
+                if job["active"]:
+                    job["message"] = "正在停止猎手任务"
+                    job["status"] = "stopping"
+                    job["event"].set()
         return True
 
     def _refresh(self, event: threading.Event) -> None:
@@ -782,29 +940,34 @@ class HunterManager:
             if event.wait(0.5):
                 return
 
-    def _run(self, event: threading.Event) -> None:
+    def _run(self, task_id: str) -> None:
+        with self.lock:
+            job = self.jobs[task_id]
+            event = job["event"]
         while not event.is_set():
             try:
-                config = self.snapshot()["config"]
+                with self.lock:
+                    config = dict(job["config"])
+                    job["status"] = "running"
                 self._refresh(event)
                 if event.is_set():
                     break
                 results = self.search(config)
-                started = parse_iso(self.snapshot().get("started_at", "")) or datetime.now(timezone.utc)
+                started = parse_iso(job.get("started_at", "")) or datetime.now(timezone.utc)
                 eligible = self.published_after(results, started)
-                unseen = [post for post in eligible if int(post["tid"]) not in self.seen_ids]
+                unseen = [post for post in eligible if int(post["tid"]) not in job["seen_ids"]]
                 new_results = [post for post in unseen if not post.get("search_excluded")]
-                self.seen_ids.update(int(post["tid"]) for post in eligible)
+                job["seen_ids"].update(int(post["tid"]) for post in eligible)
                 now = datetime.now(timezone.utc)
                 next_check = now + timedelta(seconds=int(config["interval"]))
                 with self.lock:
-                    previous = {int(post["tid"]): post for post in self.state.get("results", [])}
+                    previous = {int(post["tid"]): post for post in job.get("results", [])}
                     previous.update({int(post["tid"]): post for post in unseen})
                     tracked = sorted(previous.values(),
                                      key=lambda post: (post.get("created_at") or "", int(post["tid"])),
                                      reverse=True)[:50]
-                    self.state.update({
-                        "checks": int(self.state["checks"]) + 1,
+                    job.update({
+                        "checks": int(job["checks"]) + 1,
                         "total_matches": sum(not post.get("search_excluded") for post in tracked),
                         "excluded_count": sum(bool(post.get("search_excluded")) for post in tracked),
                         "new_hits": len(new_results),
@@ -814,22 +977,26 @@ class HunterManager:
                                     f"本轮新增 {len(new_results)} 条"),
                     })
                     if new_results:
-                        self.state["alert_id"] = int(self.state["alert_id"]) + 1
-                        self.state["latest_hits"] = new_results[:20]
+                        job["alert_id"] = int(job["alert_id"]) + 1
+                        job["latest_hits"] = new_results[:20]
                 if event.wait(int(config["interval"])):
                     break
             except Exception as exc:
                 with self.lock:
-                    self.state["error"] = str(exc)
-                    self.state["message"] = "本轮检索失败，将自动重试"
-                    self.state["next_check_at"] = (
+                    job["error"] = str(exc)
+                    job["message"] = "本轮检索失败，将自动重试"
+                    job["next_check_at"] = (
                         datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()
                 if event.wait(30):
                     break
         with self.lock:
-            self.state["active"] = False
-            self.state["next_check_at"] = None
-            self.state["message"] = "市场猎手已停止"
+            job["active"] = False
+            job["status"] = "completed"
+            job["next_check_at"] = None
+            job["completed_at"] = datetime.now(timezone.utc).isoformat()
+            job["message"] = "猎手任务已停止"
+            job["latest_hits"] = []
+            job["alert_id"] = int(job["alert_id"]) + 1
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -911,9 +1078,10 @@ class Handler(BaseHTTPRequestHandler):
             if url.path == "/api/export.csv":
                 out = io.StringIO()
                 writer = csv.writer(out)
-                writer.writerow(["tid", "时间", "分类", "标题", "用户名", "价格", "物品", "链接"])
+                writer.writerow(["tid", "时间", "帖子类型", "交易状态", "标题", "用户名", "价格", "物品", "链接"])
                 for p in self.app.repo.all_posts():
-                    writer.writerow([p.get("tid"), p.get("created_at"), p.get("category"), p.get("title"),
+                    writer.writerow([p.get("tid"), p.get("created_at"), p.get("post_type"),
+                                     p.get("category"), p.get("title"),
                                      p.get("username"), " | ".join(p.get("prices", [])),
                                      " | ".join(p.get("items", [])), p.get("url")])
                 data = ("\ufeff" + out.getvalue()).encode("utf-8")
@@ -949,6 +1117,9 @@ class Handler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[:2] == ["api", "posts"] and parts[3] == "refresh":
                 result = self.app.repo.refresh_post(int(parts[2]))
                 return self.send_json(result or {"error": "帖子不存在"}, 200 if result else 404)
+            if len(parts) == 4 and parts[:2] == ["api", "posts"] and parts[3] == "hydrate":
+                result = self.app.repo.post(int(parts[2]), hydrate=True)
+                return self.send_json(result or {"error": "帖子不存在"}, 200 if result else 404)
             if self.path == "/api/tasks/watch":
                 ok, message = self.app.tasks.start("watch", self.read_json())
                 return self.send_json({"ok": ok, "message": message}, 202 if ok else 409)
@@ -959,11 +1130,25 @@ class Handler(BaseHTTPRequestHandler):
                 ok = self.app.tasks.stop()
                 return self.send_json({"ok": ok, "message": "停止信号已发送" if ok else "当前没有任务"})
             if self.path == "/api/hunter/start":
-                ok, message = self.app.hunter.start(self.read_json())
-                return self.send_json({"ok": ok, "message": message}, 202 if ok else 409)
+                job = self.app.hunter.start_task(self.read_json())
+                return self.send_json({
+                    "ok": True, "message": f"猎手任务“{job['name']}”已启动",
+                    "task": job,
+                }, 202)
+            if self.path == "/api/hunter/edit":
+                payload = self.read_json()
+                task_id = str(payload.pop("task_id", "")).strip()
+                if not task_id:
+                    raise ValueError("缺少猎手任务 ID")
+                job = self.app.hunter.edit_task(task_id, payload)
+                return self.send_json({
+                    "ok": True, "message": f"猎手任务“{job['name']}”已更新",
+                    "task": job,
+                })
             if self.path == "/api/hunter/stop":
-                ok = self.app.hunter.stop()
-                return self.send_json({"ok": ok, "message": "市场猎手正在停止" if ok else "市场猎手未运行"})
+                task_id = str(self.read_json().get("task_id", "")).strip() or None
+                ok = self.app.hunter.stop(task_id)
+                return self.send_json({"ok": ok, "message": "猎手任务正在停止" if ok else "猎手任务未运行"})
             if self.path.startswith("/api/favorites/"):
                 tid = int(self.path.rsplit("/", 1)[1])
                 payload = self.read_json()
