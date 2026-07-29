@@ -13,6 +13,7 @@ import re
 import sqlite3
 import threading
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
@@ -219,7 +220,13 @@ class TaskManager:
             with contextlib.closing(sqlite3.connect(self.db_path)) as db:
                 row = db.execute("SELECT max(tid) FROM scan_state").fetchone()
             cursor = int(row[0] + 1) if row and row[0] is not None else 4148800
-        crawler = Crawler(self.settings(options))
+        list_options = dict(options)
+        # Forum list responses are slower than individual thread pages. Give
+        # discovery its own retry budget without making every detail worker
+        # wait this long.
+        list_options["timeout"] = max(12.0, float(options.get("timeout", 6)))
+        list_options["retries"] = max(1, int(options.get("retries", 0)))
+        crawler = Crawler(self.settings(list_options))
         selected_types = crawler.s.post_types
         previous_sync = int(store.get_meta("forum_sync_time") or 0)
         legacy_mode = (
@@ -238,15 +245,20 @@ class TaskManager:
 
         # Large 500-row pages intermittently make the forum's own upstream
         # request hit its 10-second cURL timeout. Smaller pages are more stable.
-        list_step = max(50, min(int(options.get("forum_step", 100)), 100))
+        list_step = max(20, min(int(options.get("forum_step", 50)), 50))
         # Preserve the former 5k/10k-row discovery coverage after reducing
-        # each request from 500 rows to 100.
-        max_pages = 50 if legacy_mode else 100
+        # each request to 50 rows.
+        max_pages = 100 if legacy_mode else 200
         discovered: dict[int, dict[str, Any]] = {}
         latest_tid = 0
         page = 1
         while page <= max_pages and not self.stop_event.is_set():
-            rows = crawler.fetch_forum_page(MARKET_FID, page, list_step)
+            try:
+                rows = crawler.fetch_forum_page(MARKET_FID, page, list_step)
+            except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
+                raise RuntimeError(
+                    "交易区列表读取超时；请确认当前使用内地 IP，或稍后重试"
+                ) from exc
             if not rows:
                 break
             ordinary = [row for row in rows if is_market_post(row)]
