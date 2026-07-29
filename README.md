@@ -24,7 +24,7 @@
 ├── web/                   # Web 控制台静态资源
 ├── start_web.bat          # Windows 一键启动脚本
 ├── desktop_app.py         # 桌面窗口及 Python 服务生命周期托管
-├── .exe/                  # Windows 成品、构建脚本及桌面依赖
+├── .exe/                  # Windows 成品及桌面构建依赖
 ├── packaging/             # PyInstaller 生成的打包配置（构建时创建）
 ├── samples/captured/      # 本地抓取的 HTML、JSONL 与页面脚本样本
 ├── tests/                 # 自动化测试
@@ -106,16 +106,23 @@ python web_app.py
 
 ### Windows 桌面版（关闭窗口即停止 Python）
 
-双击 `.exe\build_desktop.bat` 构建，首次构建会安装 PyWebView 和 PyInstaller。产物位于：
+安装桌面构建依赖后，直接使用 PyInstaller 打包 `desktop_app.py`：
+
+```powershell
+python -m pip install -r .exe/requirements-desktop.txt
+python -m PyInstaller --noconfirm --clean --onefile --windowed --name SDGun-Market --distpath .exe --add-data "web;web" --collect-all webview desktop_app.py
+```
+
+产物位于：
 
 ```text
 .exe\SDGun-Market.exe
 ```
 
-将 `SDGun-Market.exe` 放在可写目录中运行。程序会自动启动本地 Python 服务并在独立
-桌面窗口中打开控制台；关闭该窗口后，本地服务、市场猎手和正在执行的采集任务都会停止，
-不会继续留在后台。数据库保存在 exe 同目录的 `data/main/sdgun_market.db`；复制 exe 时
-如需保留数据，请一并复制整个 `data` 目录。
+`SDGun-Market.exe` 直接包含桌面入口、Python 服务和网页资源，不经过 BAT，也不要求
+目标电脑预装 Python。关闭桌面窗口后，本地服务、市场猎手和正在执行的采集任务都会停止，
+不会继续留在后台。数据库保存在 EXE 同目录的 `data/main/sdgun_market.db`；迁移时请
+同时复制整个 `data` 目录。
 
 开发时可先直接运行桌面入口验证：
 
