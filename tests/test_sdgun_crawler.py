@@ -19,6 +19,28 @@ from sdgun_crawler import (
 
 
 class ParserTests(unittest.TestCase):
+    def test_thread_timeout_falls_back_to_public_view_page(self):
+        crawler = Crawler(Settings(1, 0, False, 50, 1, "【二手出售】", ()))
+        row = {
+            "tid": 123, "fid": 176, "typeid": 102, "is_top": -1,
+            "title": "【二手出售】备用详情入口", "content": "配件 300元",
+            "create_time": 1784642106,
+        }
+        page = ('<script>var row=' + json.dumps(row) + ';</script>').encode()
+        calls = []
+
+        def request(url):
+            calls.append(url)
+            if "threadWapPage" in url:
+                raise TimeoutError("论坛请求超时")
+            return page
+
+        crawler._request = request
+        status, post = crawler.fetch_thread(123)
+        self.assertEqual(status, "matched")
+        self.assertIn("threadViewPage", post["url"])
+        self.assertEqual(len(calls), 2)
+
     def test_content_only_images_and_links(self):
         text, images, links = clean_rich_text(
             '<p>正文 <a href="https://m.tb.cn/a">闲鱼</a></p>'
@@ -79,16 +101,46 @@ class ParserTests(unittest.TestCase):
         text = "PEQ-15，2026-02-25，售价1380元，另一个¥280，4件38000"
         self.assertEqual(extract_prices(text), ["1380", "280"])
 
+    def test_zhang_price_and_vfc_bcm_compound_item(self):
+        title = "【二手出售】028出vfc bcm 48张"
+        details = extract_item_details(title, "ge的\n\n4800自提", [])
+        self.assertEqual([item["name"] for item in details], ["vfc bcm"])
+        self.assertEqual(details[0]["prices"], ["4800"])
+        self.assertEqual(extract_prices(title), ["4800"])
+        self.assertEqual(extract_prices("降价5.5张"), ["550"])
+
+    def test_beiqing_2011c2_is_one_item_and_region_prefix_is_removed(self):
+        title = "【二手出售】0512/021 真全息 悍武 北青2011"
+        body = (
+            "出悍武真全息+侧翻\n\n"
+            "[url=http://app.sdgun.com.cn/mag/circle/v1/forum/threadWapPage?tid=4143300]"
+            "http://app.sdgun.com.cn/mag/circle/v1/forum/threadWapPage?tid=4143300[/url]\n\n"
+            "出99.9新北青2011c2"
+        )
+        text, _, links, _, _ = clean_rich_content(body)
+        details = extract_item_details(title, text, [])
+        self.assertEqual(
+            [item["name"] for item in details],
+            ["真全息", "悍武", "北青2011c2"],
+        )
+        self.assertNotIn("[url=", text)
+        self.assertEqual(text.count("threadWapPage"), 1)
+        self.assertEqual(len(links), 1)
+
     def test_sold_has_priority_but_question_does_not(self):
         self.assertEqual(classify("【二手出售】配件", "100元", [{"content_text": "已出"}]), "已出")
         self.assertEqual(classify("【二手出售】配件", "100元", [{"content_text": "已出了吗？"}]), "出售")
         self.assertEqual(classify("【二手出售】配件", "所以900出了", []), "出售")
+        self.assertEqual(
+            classify("【二手出售】好价出多个物品", "400出，一经售出，不退不换", []),
+            "出售",
+        )
 
     def test_numbered_and_blank_lines_are_classified_per_item(self):
         body = "1. 锦明波箱 300元 已出\n\n2、红点 200元\n\n3）求购握把 100元"
         details = extract_item_details("【二手出售】多个配件", body, [])
         self.assertEqual([x["status"] for x in details], ["已出", "出售", "求购"])
-        self.assertEqual(category_from_items(details, "出售"), "出售+求购")
+        self.assertEqual(category_from_items(details, "出售"), "出售")
 
     def test_partially_sold_without_wanted_is_not_mixed(self):
         details = [

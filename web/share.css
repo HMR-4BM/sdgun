@@ -1,0 +1,37 @@
+.drawer-head {
+  gap: 16px;
+}
+
+.drawer-head h2 {
+  max-width: 410px;
+}
+
+.drawer-actions {
+  display: flex;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 8px;
+}
+
+.drawer-head .share-button {
+  display: inline-flex;
+  width: auto;
+  align-items: center;
+  justify-content: center;
+  gap: 5px;
+  padding: 0 11px;
+  border: 1px solid #29423f;
+  border-radius: 16px;
+  background: #10221f;
+  color: var(--cyan);
+  font: 600 10px/1 inherit;
+}
+
+.drawer-head .share-button:hover {
+  border-color: var(--cyan);
+  background: #13302c;
+}
+
+.drawer-head .share-button span {
+  font-size: 13px;
+}

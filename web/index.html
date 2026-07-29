@@ -7,11 +7,16 @@
   <title>SDGun Market Radar</title>
   <link rel="icon" href="/favicon.svg" type="image/svg+xml">
   <link rel="stylesheet" href="/styles.css">
-  <link rel="stylesheet" href="/sync.css">
+  <link rel="stylesheet" href="/sync.css?v=market-index-2">
   <link rel="stylesheet" href="/favorites.css">
   <link rel="stylesheet" href="/post-types.css">
+  <link rel="stylesheet" href="/share.css?v=post-share-1">
 </head>
 <body>
+  <div id="desktopOnly" class="desktop-only" role="status">
+    <strong>请使用桌面端打开市场雷达</strong>
+    <span>量化仪表盘仅在桌面设备加载和渲染</span>
+  </div>
   <div class="shell">
     <aside class="sidebar">
       <div class="brand"><span class="brand-mark">S</span><div><strong>Market Radar</strong><small>SDGUN INTELLIGENCE</small></div></div>
@@ -60,6 +65,8 @@
           <article class="kpi"><div class="kpi-top"><span>公开标记售出率</span><i class="green">◆</i></div><strong id="kpiSoldRate">—</strong><small><em id="kpiSold">—</em> 条已出</small></article>
           <article class="kpi"><div class="kpi-top"><span>价格中位数</span><i class="amber">¥</i></div><strong id="kpiPrice">—</strong><small>仅统计明确价格语境</small></article>
           <article class="kpi"><div class="kpi-top"><span>活跃用户</span><i class="violet">●</i></div><strong id="kpiUsers">—</strong><small><span id="kpiComments">—</span> 条已采集评论</small></article>
+          <article class="kpi market-kpi"><div class="kpi-top"><span>市场综合指数</span><i class="cyan">●</i></div><strong id="kpiMarket">—</strong><small><em id="kpiMarketLevel">等待日盘</em> · <span id="kpiMarketTrend">—</span></small></article>
+          <article class="kpi fear-kpi"><div class="kpi-top"><span>市场恐惧指数</span><i class="fear">▲</i></div><strong id="kpiFear">—</strong><small><em id="kpiFearLevel">等待日盘</em> · 置信度 <span id="kpiFearConfidence">—</span></small></article>
         </div>
 
         <div class="dashboard-grid">
@@ -69,7 +76,34 @@
           <article class="panel"><div class="panel-head"><div><h3>价格带分布</h3><p>人民币区间</p></div><span id="avgPrice" class="metric-note">均价 —</span></div><div id="priceBands" class="bar-list"></div></article>
           <article class="panel users-panel"><div class="panel-head"><div><h3>活跃发布者</h3><p>周期内发帖次数</p></div></div><div id="topUsers" class="rank-list"></div></article>
           <article class="panel signal-panel"><div><p class="eyebrow">DATA COVERAGE</p><h3>数据覆盖</h3></div><div class="signal-stats"><div><strong id="coverageImages">—</strong><span>帖子图片</span></div><div><strong id="coverageLinks">—</strong><span>闲鱼链接</span></div><div><strong id="latestTid">—</strong><span>最高已收录 TID</span></div></div></article>
-          <article class="panel daily-panel"><div class="panel-head"><div><h3>每日盘数据</h3><p>Asia/Taipei 自然日 · 所有指标均由实际帖子量化</p></div><a class="metric-note daily-export" href="/api/export-daily.csv">导出日盘 CSV</a></div><div class="daily-table"><div class="daily-head"><span>日期 / TID区间</span><span>发帖量</span><span>出售 / 已出 / 求购</span><span>售出率</span><span>价格中位数</span><span>活跃用户</span><span>评论 / 闲鱼</span><span>量环比</span></div><div id="dailyRows"></div></div></article>
+          <article class="panel index-panel">
+            <div class="panel-head">
+              <div><h3>市场指数趋势</h3><p>0–100 标准化刻度 · 数值越高代表对应状态越强</p></div>
+              <span id="indexTrendNote" class="metric-note">等待日盘</span>
+            </div>
+            <div class="index-legend" aria-label="趋势图图例">
+              <span><i class="market-line"></i>市场综合指数</span>
+              <span><i class="fear-line"></i>市场恐惧指数</span>
+              <span><i class="average-line"></i>市场指数 7 日均线</span>
+              <em>市场指数 = 100 − 恐惧指数</em>
+            </div>
+            <div class="index-layout">
+              <div>
+                <div class="chart-wrap"><canvas id="indexChart" role="img" aria-label="市场综合指数、市场恐惧指数和市场指数七日均线趋势图"></canvas><div id="indexEmpty" class="empty-chart">等待更多数据</div></div>
+                <div class="index-scale"><span>0 · 弱</span><span>50 · 中性</span><span>100 · 强</span></div>
+              </div>
+              <div>
+                <div id="fearComponents" class="component-list"></div>
+                <div class="component-note">压力分项：50 为历史中性；高于 50 表示压力增强，低于 50 表示压力缓解。</div>
+              </div>
+            </div>
+            <div class="confidence-source">
+              <strong>置信度来源</strong>
+              <span>当日帖子样本占 70%，明确价格样本占 30%；再按最多 14 个历史基准日，将冷启动修正系数从 70% 逐步提高到 100%。</span>
+              <em id="confidenceSourceCurrent">等待日盘样本</em>
+            </div>
+          </article>
+          <article class="panel daily-panel"><div class="panel-head"><div><h3>每日盘数据</h3><p>Asia/Taipei 自然日 · 所有指标均由实际帖子量化</p></div><a class="metric-note daily-export" href="/api/export-daily.csv">导出日盘 CSV</a></div><div class="daily-table"><div class="daily-head"><span>日期 / TID区间</span><span>市场 / 恐惧</span><span>趋势</span><span>发帖量</span><span>出售 / 已出 / 求购</span><span>售出率</span><span>价格中位数</span><span>活跃用户</span><span>量环比</span></div><div id="dailyRows"></div></div></article>
         </div>
       </section>
 
@@ -84,7 +118,7 @@
           <div><span>检索范围</span><div class="segmented compact" id="searchField"><button class="active" data-field="all">全部内容</button><button data-field="title">仅标题</button><button data-field="author">仅作者</button></div></div>
           <small id="searchHint">任意关键词出现在标题、作者、正文或物品明细中即可</small>
         </div>
-        <div class="table-panel"><div class="post-table-head"><span>帖子 / 发布者</span><span>状态</span><span>价格</span><span>发布时间</span></div><div id="postList" class="post-list"></div><button id="loadMore" class="load-more">加载更多</button></div>
+        <div class="table-panel"><div class="post-table-head"><span>帖子 / 发布者</span><span>价格</span><span>发布时间</span></div><div id="postList" class="post-list"></div><button id="loadMore" class="load-more">加载更多</button></div>
       </section>
 
       <section id="favorites" class="section">
@@ -122,9 +156,9 @@
     </main>
   </div>
 
-  <aside id="detailDrawer" class="drawer" aria-hidden="true"><div class="drawer-head"><div><p class="eyebrow">POST DETAIL</p><h2 id="detailTitle">帖子详情</h2></div><button id="closeDrawer" aria-label="关闭">×</button></div><div id="detailBody" class="drawer-body"></div></aside><div id="backdrop" class="backdrop"></div>
+  <aside id="detailDrawer" class="drawer" aria-hidden="true"><div class="drawer-head"><div><p class="eyebrow">POST DETAIL</p><h2 id="detailTitle">帖子详情</h2></div><div class="drawer-actions"><button id="sharePost" class="share-button" type="button" aria-label="分享帖子" title="分享帖子"><span aria-hidden="true">↗</span> 分享</button><button id="closeDrawer" aria-label="关闭">×</button></div></div><div id="detailBody" class="drawer-body"></div></aside><div id="backdrop" class="backdrop"></div>
   <div id="imageLightbox" class="image-lightbox" aria-hidden="true"><button id="lightboxClose" aria-label="关闭大图">×</button><img id="lightboxImage" alt=""></div>
   <div id="toast" class="toast" role="status"></div>
-  <script src="/app.js"></script>
+  <script src="/app.js?v=post-share-1"></script>
 </body>
 </html>

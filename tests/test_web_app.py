@@ -1,13 +1,14 @@
 import json
 import sqlite3
 import tempfile
+import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 from unittest.mock import patch
 
 from sdgun_crawler import Store
-from web_app import HunterManager, Repository, TaskManager
+from web_app import HunterManager, Repository, TaskManager, enrich_market_indices
 
 
 def sample(tid, created_at, category="出售", prices=None):
@@ -172,6 +173,36 @@ class RepositoryTests(unittest.TestCase):
             self.assertFalse(hunter.jobs[second["id"]]["event"].is_set())
             hunter.stop()
 
+    def test_market_hunter_tasks_persist_resume_immediately_and_delete(self):
+        resumed = []
+
+        def wait_until_stopped(manager, task_id):
+            resumed.append(task_id)
+            with manager.lock:
+                event = manager.jobs[task_id]["event"]
+            event.wait(1)
+
+        with patch.object(HunterManager, "_run", wait_until_stopped):
+            first_manager = HunterManager(self.repo, TaskManager(self.path))
+            created = first_manager.start_task({"name": "持久任务", "q": "物品10"})
+            first_manager.close()
+
+            resumed.clear()
+            second_manager = HunterManager(self.repo, TaskManager(self.path))
+            for _ in range(20):
+                if resumed:
+                    break
+                threading.Event().wait(0.01)
+            self.assertEqual(resumed, [created["id"]])
+            restored = second_manager.snapshot()["tasks"][0]
+            self.assertTrue(restored["active"])
+            self.assertIn("立即同步", restored["message"])
+            self.assertTrue(second_manager.delete_task(created["id"]))
+            self.assertEqual(second_manager.snapshot()["tasks"], [])
+
+            third_manager = HunterManager(self.repo, TaskManager(self.path))
+            self.assertEqual(third_manager.snapshot()["tasks"], [])
+
     def test_summary_quantifies_status_and_price(self):
         result = self.repo.summary({"days": ["3650"]})
         self.assertEqual(result["kpis"]["posts"], 2)
@@ -310,6 +341,56 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(latest["sold_rate"], 100.0)
         self.assertEqual(latest["median_price"], 300.0)
         self.assertEqual(latest["active_users"], 1)
+        self.assertEqual(latest["fear_index"], 50.0)
+        self.assertEqual(latest["fear_level"], "中性")
+        self.assertEqual(latest["fear_confidence"], 4.7)
+        self.assertEqual(latest["market_index"], 50.0)
+        self.assertEqual(latest["market_level"], "平衡")
+        self.assertEqual(latest["fear_baseline_days"], 1)
+        self.assertEqual(set(latest["fear_components"]), {
+            "liquidity_pressure", "supply_pressure", "price_pressure", "activity_shock",
+        })
+
+    def test_market_indices_use_rolling_baseline_and_detect_stress_trend(self):
+        def market_day(day, posts=20, selling=12, sold=6, wanted=2,
+                       sold_rate=33.3, price_change=0.0):
+            return {
+                "day": f"2026-07-{day:02d}", "posts": posts, "selling": selling,
+                "sold": sold, "wanted": wanted, "sold_rate": sold_rate,
+                "price_samples": 10, "median_price_change_pct": price_change,
+            }
+
+        rows = [market_day(day) for day in range(1, 15)]
+        rows.append(market_day(
+            15, posts=40, selling=38, sold=2, wanted=0,
+            sold_rate=5.0, price_change=-20.0,
+        ))
+        enriched = enrich_market_indices(rows)
+        stable = enriched[13]
+        stressed = enriched[14]
+        self.assertAlmostEqual(stable["fear_index"], 50.0, delta=0.1)
+        self.assertGreater(stressed["fear_index"], 80)
+        self.assertEqual(stressed["fear_level"], "极度恐惧")
+        self.assertEqual(stressed["market_level"], "低迷")
+        self.assertEqual(stressed["fear_trend"], "升温")
+        self.assertEqual(stressed["market_trend"], "走弱")
+        self.assertEqual(stressed["fear_baseline_days"], 14)
+        self.assertEqual(stressed["fear_confidence"], 100.0)
+        self.assertGreater(stressed["fear_ma7"], stable["fear_ma7"])
+
+    def test_unmarked_sold_status_cannot_trigger_fear_by_itself(self):
+        rows = [{
+            "day": f"2026-07-{day:02d}", "posts": 20, "selling": 14,
+            "sold": 6, "wanted": 0, "sold_rate": 30.0,
+            "price_samples": 10, "median_price_change_pct": 0.0,
+        } for day in range(1, 15)]
+        rows.append({
+            **rows[-1], "day": "2026-07-15", "selling": 20,
+            "sold": 0, "sold_rate": 0.0,
+        })
+        latest = enrich_market_indices(rows)[-1]
+        self.assertLess(latest["fear_index"], 60)
+        self.assertNotIn(latest["fear_level"], {"恐惧", "极度恐惧"})
 
 
 if __name__ == "__main__":

@@ -236,8 +236,12 @@ class TaskManager:
                 ).fetchall()
             } if legacy_mode else set()
 
-        list_step = max(100, min(int(options.get("forum_step", 500)), 500))
-        max_pages = 10 if legacy_mode else 20
+        # Large 500-row pages intermittently make the forum's own upstream
+        # request hit its 10-second cURL timeout. Smaller pages are more stable.
+        list_step = max(50, min(int(options.get("forum_step", 100)), 100))
+        # Preserve the former 5k/10k-row discovery coverage after reducing
+        # each request from 500 rows to 100.
+        max_pages = 50 if legacy_mode else 100
         discovered: dict[int, dict[str, Any]] = {}
         latest_tid = 0
         page = 1
@@ -323,7 +327,7 @@ class Repository:
                 db.execute("ALTER TABLE favorites ADD COLUMN note TEXT NOT NULL DEFAULT ''")
             db.execute("UPDATE scan_state SET status='matched' WHERE tid IN (SELECT tid FROM posts)")
             version = db.execute("SELECT value FROM metadata WHERE key='item_schema_version'").fetchone()
-            if not version or version[0] != "8":
+            if not version or version[0] not in {"9", "10"}:
                 rows = db.execute("SELECT tid, data FROM posts").fetchall()
                 for tid, raw in rows:
                     post = json.loads(raw)
@@ -343,7 +347,7 @@ class Repository:
                                (post["category"], searchable_text(post),
                                 json.dumps(post, ensure_ascii=False), tid))
                     save_monthly_post(db_path, post)
-                db.execute("INSERT OR REPLACE INTO metadata VALUES('item_schema_version','8')")
+                db.execute("INSERT OR REPLACE INTO metadata VALUES('item_schema_version','9')")
             db.commit()
 
     def connect(self) -> sqlite3.Connection:
@@ -573,7 +577,8 @@ class Repository:
             "posts", "selling", "sold", "wanted", "uncertain", "sold_rate", "active_users",
             "item_count", "price_samples", "average_price", "median_price", "minimum_price",
             "maximum_price", "listed_value_sum", "comments", "images", "xianyu_links",
-            "post_change_pct", "median_price_change_pct", "updated_at", "data",
+            "post_change_pct", "median_price_change_pct", "fear_index", "fear_level",
+            "fear_confidence", "updated_at", "data",
         )
         placeholders = ",".join("?" for _ in columns)
         with contextlib.closing(self.connect()) as db:
@@ -724,6 +729,120 @@ def percent_change(current: float | int | None, previous: float | int | None) ->
     return round((float(current) - float(previous)) / float(previous) * 100, 1)
 
 
+def clamp_score(value: float) -> float:
+    return max(0.0, min(100.0, value))
+
+
+def market_fear_metrics(row: dict[str, Any],
+                        history: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """Return an adaptive 0–100 stress score against the preceding 30 market days."""
+    history = (history or [])[-30:]
+    classified = row["selling"] + row["sold"] + row["wanted"]
+    sale_supply_share = (
+        100.0 * (row["selling"] + row["sold"]) / classified
+        if classified else None
+    )
+    established = len(history) >= 3
+    historical_sold_rates = [float(item["sold_rate"]) for item in history]
+    historical_supply = [
+        100.0 * (item["selling"] + item["sold"]) / total
+        for item in history
+        if (total := item["selling"] + item["sold"] + item["wanted"])
+    ]
+    liquidity = clamp_score(
+        50.0 + 1.5 * (median(historical_sold_rates) - float(row["sold_rate"]))
+    ) if established and historical_sold_rates else 50.0
+    supply = clamp_score(
+        50.0 + 2.0 * (sale_supply_share - median(historical_supply))
+    ) if established and sale_supply_share is not None and historical_supply else 50.0
+    price_change = row.get("median_price_change_pct")
+    absolute_price_pressure = (
+        clamp_score(50.0 - 2.5 * float(price_change))
+        if price_change is not None else 50.0
+    )
+    historical_price_changes = [
+        float(item["median_price_change_pct"])
+        for item in history if item.get("median_price_change_pct") is not None
+    ]
+    if price_change is not None and len(historical_price_changes) >= 5:
+        stress = -float(price_change)
+        historical_stress = [-value for value in historical_price_changes]
+        relative_price_pressure = 100.0 * (
+            sum(value < stress for value in historical_stress)
+            + 0.5 * sum(value == stress for value in historical_stress)
+            + 0.5
+        ) / (len(historical_price_changes) + 1)
+        price = clamp_score(0.4 * absolute_price_pressure + 0.6 * relative_price_pressure)
+    else:
+        price = absolute_price_pressure
+    historical_posts = [int(item["posts"]) for item in history]
+    if established and historical_posts:
+        normal_posts = max(1.0, float(median(historical_posts)))
+        volume_surge = max(0.0, (float(row["posts"]) - normal_posts) / normal_posts * 100.0)
+        activity = clamp_score(50.0 + volume_surge * 0.5 * (supply / 100.0))
+    else:
+        activity = 50.0
+    # Sellers often leave completed listings unmarked, so the public sold rate
+    # is deliberately a weak signal instead of the main driver.
+    score = round(0.15 * liquidity + 0.30 * supply + 0.35 * price + 0.20 * activity, 1)
+    if score >= 80:
+        level = "极度恐惧"
+    elif score >= 60:
+        level = "恐惧"
+    elif score >= 40:
+        level = "中性"
+    elif score >= 20:
+        level = "贪婪"
+    else:
+        level = "极度贪婪"
+    sample_confidence = min(1.0, row["posts"] / 20) * 70 + min(1.0, row["price_samples"] / 10) * 30
+    baseline_coverage = min(1.0, len(history) / 14)
+    confidence = round(sample_confidence * (0.7 + 0.3 * baseline_coverage), 1)
+    return {
+        "fear_index": score,
+        "fear_level": level,
+        "fear_confidence": confidence,
+        "fear_baseline_days": len(history),
+        "fear_components": {
+            "liquidity_pressure": round(liquidity, 1),
+            "supply_pressure": round(supply, 1),
+            "price_pressure": round(price, 1),
+            "activity_shock": round(activity, 1),
+        },
+    }
+
+
+def enrich_market_indices(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Attach adaptive fear, health and multi-day trend fields in chronological order."""
+    for index, row in enumerate(rows):
+        row.update(market_fear_metrics(row, rows[max(0, index - 30):index]))
+        fears = [float(item["fear_index"]) for item in rows[:index + 1]]
+        row["fear_change_1d"] = round(fears[-1] - fears[-2], 1) if len(fears) >= 2 else None
+        row["fear_ma7"] = round(sum(fears[-7:]) / len(fears[-7:]), 1)
+        row["fear_ma30"] = round(sum(fears[-30:]) / len(fears[-30:]), 1)
+        if len(fears) >= 6:
+            trend_delta = sum(fears[-3:]) / 3 - sum(fears[-6:-3]) / 3
+        elif len(fears) >= 2:
+            trend_delta = fears[-1] - fears[-2]
+        else:
+            trend_delta = 0.0
+        row["fear_trend_delta"] = round(trend_delta, 1)
+        row["fear_trend"] = "升温" if trend_delta >= 3 else ("降温" if trend_delta <= -3 else "平稳")
+        row["market_index"] = round(100.0 - row["fear_index"], 1)
+        row["market_index_ma7"] = round(100.0 - row["fear_ma7"], 1)
+        row["market_level"] = (
+            "强势" if row["market_index"] >= 80 else
+            "偏强" if row["market_index"] >= 60 else
+            "平衡" if row["market_index"] >= 40 else
+            "偏弱" if row["market_index"] >= 20 else "低迷"
+        )
+        row["market_trend"] = (
+            "改善" if row["fear_trend"] == "降温" else
+            "走弱" if row["fear_trend"] == "升温" else "横盘"
+        )
+    return rows
+
+
 def build_daily_market(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     grouped: defaultdict[str, list[tuple[datetime, dict[str, Any]]]] = defaultdict(list)
     for post in posts:
@@ -774,7 +893,7 @@ def build_daily_market(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
         }
         result.append(row)
         previous = row
-    return result
+    return enrich_market_indices(result)
 
 
 class HunterManager:
@@ -785,6 +904,58 @@ class HunterManager:
         self.tasks = tasks
         self.lock = threading.Lock()
         self.jobs: dict[str, dict[str, Any]] = {}
+        self.state_path = tasks.db_path.with_name("hunter_tasks.json")
+        self.closing = False
+        self._restore()
+
+    def _persist_locked(self) -> None:
+        payload = []
+        for job in self.jobs.values():
+            saved = self._copy_job(job)
+            saved["enabled"] = bool(job.get("enabled", job.get("active")))
+            saved["seen_ids"] = sorted(job.get("seen_ids", set()))
+            payload.append(saved)
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = self.state_path.with_suffix(".tmp")
+        temporary.write_text(json.dumps(
+            {"version": 1, "tasks": payload}, ensure_ascii=False, indent=2,
+        ), encoding="utf-8")
+        temporary.replace(self.state_path)
+
+    def _restore(self) -> None:
+        if not self.state_path.exists():
+            return
+        try:
+            payload = json.loads(self.state_path.read_text(encoding="utf-8"))
+            saved_jobs = payload.get("tasks", [])
+        except (OSError, ValueError, AttributeError):
+            return
+        resumable: list[str] = []
+        with self.lock:
+            for saved in saved_jobs:
+                try:
+                    task_id = str(saved["id"])
+                    config = self.normalize(saved["config"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                enabled = bool(saved.get("enabled", False))
+                event = threading.Event()
+                job = {
+                    **saved, "id": task_id, "config": config,
+                    "active": enabled, "enabled": enabled, "event": event,
+                    "seen_ids": {int(value) for value in saved.get("seen_ids", [])},
+                    "latest_hits": [], "next_check_at": None,
+                    "status": "scheduled" if enabled else "completed",
+                    "message": "主进程已恢复，正在立即同步" if enabled else saved.get("message", "猎手任务已停止"),
+                }
+                self.jobs[task_id] = job
+                if enabled:
+                    resumable.append(task_id)
+            for task_id in resumable:
+                thread = threading.Thread(target=self._run, args=(task_id,), daemon=True,
+                                          name=f"sdgun-hunter-{task_id}")
+                self.jobs[task_id]["thread"] = thread
+                thread.start()
 
     @staticmethod
     def normalize(options: dict[str, Any]) -> dict[str, Any]:
@@ -852,7 +1023,7 @@ class HunterManager:
         event = threading.Event()
         name = str(options.get("name", "")).strip()[:60] or config["q"]
         job: dict[str, Any] = {
-            "id": task_id, "name": name, "active": True,
+            "id": task_id, "name": name, "active": True, "enabled": True,
             "status": "scheduled", "message": "已建立当前起点，等待新帖",
             "config": config, "created_at": datetime.now(timezone.utc).isoformat(),
             "started_at": started.isoformat(), "completed_at": None,
@@ -867,6 +1038,7 @@ class HunterManager:
                                       name=f"sdgun-hunter-{task_id}")
             job["thread"] = thread
             thread.start()
+            self._persist_locked()
         return self._copy_job(job)
 
     def start(self, options: dict[str, Any]) -> tuple[bool, str]:
@@ -906,6 +1078,7 @@ class HunterManager:
                 job["message"] = "规则已更新，已从当前时间重新建立追踪起点"
             elif active:
                 job["message"] = "任务设置已更新"
+            self._persist_locked()
             return self._copy_job(job)
 
     def stop(self, task_id: str | None = None) -> bool:
@@ -922,8 +1095,35 @@ class HunterManager:
                 if job["active"]:
                     job["message"] = "正在停止猎手任务"
                     job["status"] = "stopping"
+                    job["enabled"] = False
                     job["event"].set()
+            self._persist_locked()
         return True
+
+    def delete_task(self, task_id: str) -> bool:
+        with self.lock:
+            job = self.jobs.pop(task_id, None)
+            if not job:
+                return False
+            job["deleted"] = True
+            job["enabled"] = False
+            job["event"].set()
+            self._persist_locked()
+        return True
+
+    def close(self) -> None:
+        """Stop worker threads while preserving enabled tasks for next launch."""
+        with self.lock:
+            self.closing = True
+            self._persist_locked()
+            threads = []
+            for job in self.jobs.values():
+                if job.get("active"):
+                    job["event"].set()
+                    if job.get("thread"):
+                        threads.append(job["thread"])
+        for thread in threads:
+            thread.join(timeout=2)
 
     def _refresh(self, event: threading.Event) -> None:
         task = self.tasks.snapshot()
@@ -979,6 +1179,7 @@ class HunterManager:
                     if new_results:
                         job["alert_id"] = int(job["alert_id"]) + 1
                         job["latest_hits"] = new_results[:20]
+                    self._persist_locked()
                 if event.wait(int(config["interval"])):
                     break
             except Exception as exc:
@@ -987,9 +1188,19 @@ class HunterManager:
                     job["message"] = "本轮检索失败，将自动重试"
                     job["next_check_at"] = (
                         datetime.now(timezone.utc) + timedelta(seconds=30)).isoformat()
+                    self._persist_locked()
                 if event.wait(30):
                     break
         with self.lock:
+            if job.get("deleted"):
+                return
+            if self.closing and job.get("enabled"):
+                job["active"] = True
+                job["status"] = "scheduled"
+                job["next_check_at"] = None
+                job["message"] = "任务已保存，将在下次启动时立即同步"
+                self._persist_locked()
+                return
             job["active"] = False
             job["status"] = "completed"
             job["next_check_at"] = None
@@ -997,6 +1208,7 @@ class HunterManager:
             job["message"] = "猎手任务已停止"
             job["latest_hits"] = []
             job["alert_id"] = int(job["alert_id"]) + 1
+            self._persist_locked()
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -1093,14 +1305,25 @@ class Handler(BaseHTTPRequestHandler):
                 writer.writerow(["日期", "时区", "首TID", "末TID", "发帖量", "出售", "已出", "求购",
                                  "公开售出率%", "活跃用户", "物品条目", "价格样本", "均价", "中位数",
                                  "最低价", "最高价", "标价合计", "评论", "图片", "闲鱼链接",
-                                 "发帖量环比%", "中位价环比%", "首帖时间", "末帖时间"])
+                                 "发帖量环比%", "中位价环比%", "市场综合指数", "市场等级", "市场趋势",
+                                 "恐惧指数", "恐惧等级", "恐惧日变化", "恐惧7日均线", "恐惧30日均线",
+                                 "恐惧趋势", "趋势幅度", "置信度%", "基准天数",
+                                 "成交状态压力", "供给失衡压力", "价格压力", "放量冲击",
+                                 "首帖时间", "末帖时间"])
                 for row in self.app.repo.daily({"limit": ["3650"]})["items"]:
-                    writer.writerow([row.get(key) for key in (
+                    values = [row.get(key) for key in (
                         "day", "timezone", "first_tid", "last_tid", "posts", "selling", "sold", "wanted",
                         "sold_rate", "active_users", "item_count", "price_samples", "average_price",
                         "median_price", "minimum_price", "maximum_price", "listed_value_sum", "comments",
                         "images", "xianyu_links", "post_change_pct", "median_price_change_pct",
-                        "first_post_time", "last_post_time")])
+                        "market_index", "market_level", "market_trend", "fear_index", "fear_level",
+                        "fear_change_1d", "fear_ma7", "fear_ma30", "fear_trend", "fear_trend_delta",
+                        "fear_confidence", "fear_baseline_days")]
+                    components = row.get("fear_components", {})
+                    values.extend(components.get(key) for key in (
+                        "liquidity_pressure", "supply_pressure", "price_pressure", "activity_shock"))
+                    values.extend((row.get("first_post_time"), row.get("last_post_time")))
+                    writer.writerow(values)
                 data = ("\ufeff" + out.getvalue()).encode("utf-8")
                 return self.send_data(data, "text/csv; charset=utf-8", extra_headers={
                     "Content-Disposition": 'attachment; filename="sdgun-daily-market.csv"'})
@@ -1149,6 +1372,11 @@ class Handler(BaseHTTPRequestHandler):
                 task_id = str(self.read_json().get("task_id", "")).strip() or None
                 ok = self.app.hunter.stop(task_id)
                 return self.send_json({"ok": ok, "message": "猎手任务正在停止" if ok else "猎手任务未运行"})
+            if self.path == "/api/hunter/delete":
+                task_id = str(self.read_json().get("task_id", "")).strip()
+                ok = self.app.hunter.delete_task(task_id)
+                return self.send_json({"ok": ok, "message": "猎手任务已删除" if ok else "猎手任务不存在"},
+                                      200 if ok else 404)
             if self.path.startswith("/api/favorites/"):
                 tid = int(self.path.rsplit("/", 1)[1])
                 payload = self.read_json()
@@ -1283,7 +1511,7 @@ def main() -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        server.hunter.stop()
+        server.hunter.close()
         server.tasks.stop()
         server.server_close()
     return 0

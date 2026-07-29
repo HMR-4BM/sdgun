@@ -22,6 +22,7 @@ import urllib.parse
 import urllib.request
 from collections import Counter
 from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
 from datetime import datetime, timedelta, timezone
 from html.parser import HTMLParser
 from pathlib import Path
@@ -30,6 +31,7 @@ from typing import Any, Iterable
 BASE = "http://app.sdgun.com.cn"
 DEFAULT_DB = Path(__file__).resolve().parent / "data" / "main" / "sdgun_market.db"
 THREAD_URL = BASE + "/mag/circle/v1/forum/threadWapPage?tid={}"
+THREAD_VIEW_URL = BASE + "/mag/circle/v1/forum/threadViewPage?tid={}"
 COMMENT_URL = BASE + "/mag/circle/v1/Forum/commentList"
 FORUM_LIST_URL = BASE + "/mag/circle/v1/Forum/threadList"
 MARKET_FID = 176
@@ -49,24 +51,41 @@ POST_TYPE_PREFIXES = {
 TITLE_RE = re.compile(r"<title[^>]*>(.*?)</title\s*>", re.I | re.S)
 ROW_RE = re.compile(r"\bvar\s+row\s*=\s*(\{.*?\})\s*;", re.S)
 CREATE_TIME_RE = re.compile(r'"create_time"\s*:\s*"?(\d{10})"?')
+CURL_TIMEOUT_RE = re.compile(rb"(?:cURL error 28|Operation timed out)", re.I)
 URL_RE = re.compile(r"https?://[^\s<>\"'，。\[\]]+", re.I)
 SOLD_RE = re.compile(r"(?:已出|已售|售出|已被秒|交易完成|已交易|sold|(?:^|\n)\s*出了\s*(?:$|\n))", re.I)
 SOLD_QUESTION_RE = re.compile(r"(?:还没|未|没)\s*(?:出|售)|(?:已出|已售|售出|出了).{0,3}[吗嘛呢？?]", re.I)
+SOLD_POLICY_RE = re.compile(
+    r"(?:一经|一旦)\s*(?:售出|卖出|出售)[，,、\s]*(?:概不|不予|不)\s*(?:退|换|退换)"
+    r"|(?:售出|卖出|出售)[，,、\s]*(?:概不|不予|不)\s*(?:退|换|退换)",
+    re.I,
+)
 WANTED_RE = re.compile(r"(?:求购|求收|收一个|收个|蹲一个|想收|高价收|长期收|收[:：])", re.I)
 SELL_RE = re.compile(r"(?:出售|出一个|出个|出手|转让|回血|明盘|包邮|不包邮|价格|￥|¥|\d+\s*元)", re.I)
 ITEM_PREFIX_RE = re.compile(
     r"^\s*(?:(?:\d{1,2}|[一二三四五六七八九十]+)\s*[.、:：)）]|[-*•])\s*"
 )
 ITEM_LINE_PRICE_RE = re.compile(
-    r"(?:明盘|售价|价格|小刀|包邮)\s*[:：]?\s*[￥¥]?\s*\d{2,6}|[￥¥]\s*\d{2,6}|\d{2,6}\s*(?:元|块)", re.I
+    r"(?:明盘|售价|价格|小刀|包邮)\s*[:：]?\s*[￥¥]?\s*\d{2,6}|[￥¥]\s*\d{2,6}|\d{2,6}\s*(?:元|块)|\d{1,3}(?:\.\d{1,2})?\s*张", re.I
 )
 TRAILING_BARE_PRICE_RE = re.compile(r"(?<![\dA-Za-z-])(\d{1,6}(?:\.\d{1,2})?)\s*$")
-REGION_SALE_PREFIX_RE = re.compile(r"^0\d{2,3}\s*(?:出|出售|出掉|出手)\s*", re.I)
+REGION_SALE_PREFIX_RE = re.compile(
+    r"^0\d{2,3}(?:\s*/\s*0\d{2,3})?\s*(?:(?:出|出售|出掉|出手)\s*)?",
+    re.I,
+)
 # A number is a price only when accompanied by a currency marker.  This avoids
 # treating dates, model names (PEQ-15) and quantities as prices.
 PRICE_RE = re.compile(
     r"(?:[￥¥]\s*(\d{1,6}(?:\.\d{1,2})?)|(?<![\dA-Za-z-])(\d{1,6}(?:\.\d{1,2})?)\s*(?:元|块(?:钱)?|包邮|不包邮))",
     re.I,
+)
+ZHANG_PRICE_RE = re.compile(
+    r"(?<![\dA-Za-z.-])(\d{1,3}(?:\.\d{1,2})?)\s*张(?![\u4e00-\u9fff])",
+    re.I,
+)
+BBCODE_URL_RE = re.compile(
+    r"\[url=(https?://[^\]]+)\].*?\[/url\]",
+    re.I | re.S,
 )
 STOPWORDS = {
     "一个", "东西", "物品", "交易", "出售", "二手出售", "包邮", "不包邮", "价格",
@@ -125,6 +144,7 @@ def clean_rich_content(value: str) -> tuple[str, list[str], list[str], list[str]
     with contextlib.suppress(Exception):
         parser.feed(value or "")
     text = html.unescape("".join(parser.parts))
+    text = BBCODE_URL_RE.sub(lambda match: match.group(1), text)
     text = re.sub(r"[ \t\r\f\v]+", " ", text)
     # Keep one blank line: paragraph boundaries are useful for splitting a
     # multi-item listing without any model/NLP call.
@@ -190,7 +210,7 @@ def is_secondhand_sale(row: dict[str, Any], prefix: str = "【二手出售】") 
 def classify(title: str, body: str, comments: list[dict[str, Any]]) -> str:
     # Comments such as “已出” often contain the freshest transaction state.
     combined = "\n".join([title, body] + [str(x.get("content_text", "")) for x in comments])
-    sold_evidence = SOLD_QUESTION_RE.sub("", combined)
+    sold_evidence = SOLD_QUESTION_RE.sub("", SOLD_POLICY_RE.sub("", combined))
     if SOLD_RE.search(sold_evidence):
         return "已出"
     if WANTED_RE.search(title + "\n" + body):
@@ -210,13 +230,13 @@ def _item_blocks(body: str) -> list[str]:
         # Treat each priced/numbered line as a new item and attach short
         # unpriced continuation lines to the previous item.
         structural_count = sum(bool(ITEM_PREFIX_RE.match(x) or ITEM_LINE_PRICE_RE.search(x)
-                                    or SOLD_RE.search(SOLD_QUESTION_RE.sub("", x))
+                                    or SOLD_RE.search(SOLD_QUESTION_RE.sub("", SOLD_POLICY_RE.sub("", x)))
                                     or WANTED_RE.search(x)) for x in paragraph_lines)
         if len(paragraph_lines) > 1 and structural_count >= 2:
             current: list[str] = []
             for line in paragraph_lines:
                 starts_item = bool(ITEM_PREFIX_RE.match(line) or ITEM_LINE_PRICE_RE.search(line)
-                                   or SOLD_RE.search(SOLD_QUESTION_RE.sub("", line))
+                                   or SOLD_RE.search(SOLD_QUESTION_RE.sub("", SOLD_POLICY_RE.sub("", line)))
                                    or WANTED_RE.search(line))
                 if starts_item and current:
                     blocks.append(" ".join(current))
@@ -237,7 +257,9 @@ def _item_blocks(body: str) -> list[str]:
 
 
 def _item_tokens(text: str) -> list[str]:
-    cleaned = SOLD_RE.sub("", PRICE_RE.sub("", ITEM_PREFIX_RE.sub("", text)))
+    cleaned = SOLD_RE.sub(
+        "", ZHANG_PRICE_RE.sub("", PRICE_RE.sub("", ITEM_PREFIX_RE.sub("", text)))
+    )
     tokens = re.findall(r"[A-Za-z][A-Za-z0-9._+-]{1,20}|[\u4e00-\u9fff]{2,10}", cleaned)
     return [x.casefold() for x in tokens if x.casefold() not in STOPWORDS][:6]
 
@@ -252,7 +274,11 @@ def extract_item_prices(text: str) -> list[str]:
 def _title_item_candidates(title_item: str) -> list[str]:
     """Split a title list after dropping a leading region-code sale marker."""
     cleaned = REGION_SALE_PREFIX_RE.sub("", title_item).strip()
-    parts = [part.strip(" -—•\t") for part in re.split(r"\s+|[、；;]+", cleaned)]
+    name_only = ZHANG_PRICE_RE.sub("", PRICE_RE.sub("", cleaned)).strip(" -—•\t")
+    # VFC BCM is a product/platform phrase, not two separately advertised items.
+    if re.fullmatch(r"vfc\s+bcm", name_only, re.I):
+        return [cleaned]
+    parts = [part.strip(" -—•\t") for part in re.split(r"\s+|[、；;]+", name_only)]
     parts = [part for part in parts if len(part) >= 2 and part.casefold() not in STOPWORDS]
     return parts if len(parts) >= 2 else ([cleaned] if cleaned else [])
 
@@ -260,6 +286,7 @@ def _title_item_candidates(title_item: str) -> list[str]:
 def _normalized_item_name(text: str) -> str:
     """Reduce common seller/material descriptions to the advertised model name."""
     cleaned = URL_RE.sub("", ITEM_PREFIX_RE.sub("", text)).strip()
+    cleaned = ZHANG_PRICE_RE.sub("", PRICE_RE.sub("", cleaned)).strip()
     cleaned = re.sub(r"[（(][^）)]*[）)]", "", cleaned)
     cleaned = TRAILING_BARE_PRICE_RE.sub("", cleaned).strip(" -—•\t")
     folded = cleaned.casefold()
@@ -286,19 +313,30 @@ def extract_item_details(title: str, body: str,
         compact = URL_RE.sub("", re.sub(r"\s+", " ", block)).strip(" -—•\t")
         if not 2 <= len(compact) <= 240:
             continue
+        price_label = ZHANG_PRICE_RE.sub("", PRICE_RE.sub("", compact))
+        price_label = price_label.strip(" -—•\t:：")
+        if price_label in {"降价", "价格", "售价", "明盘", "小刀", "包邮", "不包邮"}:
+            continue
         marked = bool(ITEM_PREFIX_RE.match(block))
         if (marked or PRICE_RE.search(compact) or ITEM_LINE_PRICE_RE.search(compact)
                 or (structured_bare_prices and TRAILING_BARE_PRICE_RE.search(compact))
-                or SOLD_RE.search(compact) or WANTED_RE.search(compact)):
+                or SOLD_RE.search(SOLD_POLICY_RE.sub("", compact)) or WANTED_RE.search(compact)):
             candidates.append(compact)
         if len(candidates) >= 20:
             break
     if not candidates and title_item:
         candidates = _title_item_candidates(title_item)
+    compound_source = title + "\n" + body
+    if re.search(r"北青\s*2011\s*c2", compound_source, re.I):
+        candidates = [
+            value for value in candidates
+            if not re.search(r"北青\s*2011(?:\s*c2)?", value, re.I)
+        ]
+        candidates.append("北青2011c2")
 
     details: list[dict[str, Any]] = []
     for index, text in enumerate(unique(candidates), 1):
-        evidence = SOLD_QUESTION_RE.sub("", text)
+        evidence = SOLD_QUESTION_RE.sub("", SOLD_POLICY_RE.sub("", text))
         status = "已出" if SOLD_RE.search(evidence) else ("求购" if WANTED_RE.search(text) else "出售")
         details.append({
             "index": index,
@@ -327,7 +365,7 @@ def extract_item_details(title: str, body: str,
     # listing it only affects an item when the comment names it or its number.
     for comment in comments or []:
         comment_text = str(comment.get("content_text") or comment.get("content") or "")
-        sold_text = SOLD_QUESTION_RE.sub("", comment_text)
+        sold_text = SOLD_QUESTION_RE.sub("", SOLD_POLICY_RE.sub("", comment_text))
         if not SOLD_RE.search(sold_text):
             continue
         if len(details) == 1:
@@ -348,7 +386,7 @@ def category_from_items(details: list[dict[str, Any]], fallback: str) -> str:
     statuses = Counter(str(x.get("status") or "待确认") for x in details)
     sale_items = statuses["出售"] + statuses["已出"]
     if sale_items and statuses["求购"]:
-        return "出售+求购"
+        return "出售"
     if sale_items and statuses["已出"] == sale_items and not statuses["求购"]:
         return "已出"
     if statuses["已出"]:
@@ -402,8 +440,18 @@ class Crawler:
     def fetch_thread(self, tid: int) -> tuple[str, dict[str, Any] | None]:
         """Return status and post, using the site's own forum/type metadata."""
         self.local.last_create_time = None
+        source_url = THREAD_URL.format(tid)
         try:
-            raw = self._request(THREAD_URL.format(tid))
+            try:
+                raw = self._request(source_url)
+            except Exception:
+                source_url = THREAD_VIEW_URL.format(tid)
+                raw = self._request(source_url)
+            if CURL_TIMEOUT_RE.search(raw) and not ROW_RE.search(
+                raw.decode("utf-8", errors="ignore")
+            ):
+                source_url = THREAD_VIEW_URL.format(tid)
+                raw = self._request(source_url)
         except Exception:
             return "unreachable", None
         # JSON strings are ASCII escaped, while titles may contain UTF-8 Chinese.
@@ -473,7 +521,7 @@ class Crawler:
         category = category_from_items(item_details, fallback_category)
         post = {
             "tid": int(row.get("tid") or tid),
-            "url": THREAD_URL.format(tid),
+            "url": source_url,
             "title": title,
             "forum_id": int(row.get("fid") or MARKET_FID),
             "is_top": int(row.get("is_top") or -1) == 1,
@@ -564,7 +612,17 @@ def keyword_in_raw_page(keyword: str, folded_page: str) -> bool:
 
 
 def extract_prices(value: str) -> list[str]:
-    return unique(next(x for x in match.groups() if x is not None) for match in PRICE_RE.finditer(value))
+    values = [
+        next(x for x in match.groups() if x is not None)
+        for match in PRICE_RE.finditer(value)
+    ]
+    for match in ZHANG_PRICE_RE.finditer(value):
+        try:
+            amount = Decimal(match.group(1)) * 100
+        except InvalidOperation:
+            continue
+        values.append(format(amount.normalize(), "f"))
+    return unique(values)
 
 
 def unique_images(values: Iterable[str]) -> list[str]:
@@ -693,6 +751,9 @@ class Store:
               xianyu_links INTEGER NOT NULL,
               post_change_pct REAL,
               median_price_change_pct REAL,
+              fear_index REAL,
+              fear_level TEXT,
+              fear_confidence REAL,
               updated_at TEXT NOT NULL,
               data TEXT NOT NULL
             );
@@ -705,6 +766,11 @@ class Store:
                            ("search_text", "TEXT")):
             if name not in existing:
                 self.db.execute(f"ALTER TABLE posts ADD COLUMN {name} {kind}")
+        daily_existing = {row[1] for row in self.db.execute("PRAGMA table_info(daily_market)")}
+        for name, kind in (("fear_index", "REAL"), ("fear_level", "TEXT"),
+                           ("fear_confidence", "REAL")):
+            if name not in daily_existing:
+                self.db.execute(f"ALTER TABLE daily_market ADD COLUMN {name} {kind}")
         self.db.execute(
             "UPDATE posts SET post_type='二手出售' WHERE post_type IS NULL OR post_type=''"
         )

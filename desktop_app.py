@@ -51,7 +51,7 @@ def main() -> int:
     finally:
         # Stop request handling first, then allow managed jobs to save/exit.
         server.shutdown()
-        server.hunter.stop()
+        server.hunter.close()
         server.tasks.stop()
         server.server_close()
         server_thread.join(timeout=5)

@@ -45,8 +45,54 @@
   box-shadow: 0 0 9px #22d3c588;
 }
 
+.inline-thread-link,
+.inline-external-link {
+  display: inline-flex;
+  align-items: center;
+  margin: 0 3px;
+  border: 1px solid #29423f;
+  text-decoration: none;
+  vertical-align: baseline;
+  cursor: pointer;
+}
+
+.post-row.read .post-title-copy > strong {
+  color: #748087;
+}
+
+.title-status {
+  display: inline;
+  margin-right: .5em;
+  border: 0;
+  padding: 0;
+  font-size: inherit;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.title-status.selling { color: var(--cyan); }
+.title-status.sold { color: var(--green); }
+.title-status.wanted { color: var(--amber); }
+.title-status.partial { color: #a3ddb1; }
+.title-status.mixed { color: #d1b4f5; }
+.title-status.uncertain,
+.title-status.excluded { color: #89949a; }
+
+.post-table-head,
+.post-row {
+  grid-template-columns: minmax(300px, 1fr) 100px 145px;
+}
+
+#postList .post-row > .status-tag {
+  display: none;
+}
+
 @media (max-width: 760px) {
   .type-nav {
     display: none;
+  }
+
+  .post-row {
+    grid-template-columns: 1fr 65px;
   }
 }
