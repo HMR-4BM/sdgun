@@ -8,7 +8,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from sdgun_crawler import Store
-from web_app import HunterManager, Repository, TaskManager, enrich_market_indices
+from web_app import (HunterManager, Repository, TaskManager, build_daily_market,
+                     enrich_market_indices)
 
 
 def sample(tid, created_at, category="出售", prices=None):
@@ -343,13 +344,37 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(latest["active_users"], 1)
         self.assertEqual(latest["fear_index"], 50.0)
         self.assertEqual(latest["fear_level"], "中性")
-        self.assertEqual(latest["fear_confidence"], 4.7)
+        self.assertEqual(latest["fear_confidence"], 3.7)
         self.assertEqual(latest["market_index"], 50.0)
         self.assertEqual(latest["market_level"], "平衡")
         self.assertEqual(latest["fear_baseline_days"], 1)
         self.assertEqual(set(latest["fear_components"]), {
             "liquidity_pressure", "supply_pressure", "price_pressure", "activity_shock",
         })
+        self.assertIn("price_comparability", latest["confidence_components"])
+
+    def test_daily_prices_exclude_wanted_and_ambiguous_multi_item_values(self):
+        post = sample(30, "2026-07-20T10:00:00+00:00", prices=["9999"])
+        post["items"] = ["红点", "握把", "求购弹匣"]
+        post["item_details"] = [
+            {"name": "红点", "status": "出售", "prices": ["200", "200"]},
+            {"name": "握把", "status": "出售", "prices": []},
+            {"name": "求购弹匣", "status": "求购", "prices": ["500"]},
+        ]
+        row = build_daily_market([post])[0]
+        self.assertEqual(row["price_samples"], 1)
+        self.assertEqual(row["median_price"], 200.0)
+        self.assertEqual(row["price_attribution_rate"], 0.5)
+
+    def test_price_change_prefers_matched_item_history(self):
+        first = sample(31, "2026-07-19T10:00:00+00:00")
+        first["item_details"] = [{"name": "红点", "status": "出售", "prices": ["200"]}]
+        second = sample(32, "2026-07-20T10:00:00+00:00")
+        second["item_details"] = [{"name": "红点", "status": "出售", "prices": ["180"]}]
+        latest = build_daily_market([first, second])[-1]
+        self.assertEqual(latest["median_price_change_pct"], -10.0)
+        self.assertEqual(latest["comparable_price_samples"], 1)
+        self.assertEqual(latest["price_change_method"], "matched_items")
 
     def test_market_indices_use_rolling_baseline_and_detect_stress_trend(self):
         def market_day(day, posts=20, selling=12, sold=6, wanted=2,

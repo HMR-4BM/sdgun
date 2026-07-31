@@ -68,6 +68,7 @@ class TaskManager:
             "running": False, "mode": None, "message": "空闲", "processed": 0,
             "matched": 0, "started_at": None, "updated_at": None, "last_tid": None,
             "statuses": {}, "error": None,
+            "server_status": None,
         }
 
     def snapshot(self) -> dict[str, Any]:
@@ -94,6 +95,7 @@ class TaskManager:
                 "matched": 0, "started_at": datetime.now(timezone.utc).isoformat(),
                 "updated_at": datetime.now(timezone.utc).isoformat(), "last_tid": None,
                 "statuses": {}, "error": None,
+                "server_status": None,
             }
             target = {"watch": self._run_watch, "refresh": self._run_refresh}[mode]
             self.thread = threading.Thread(target=target, args=(options,), daemon=True,
@@ -117,6 +119,7 @@ class TaskManager:
             str(x).strip() for x in options.get("post_types", ["二手出售"])
             if str(x).strip() in allowed_types
         ))
+        media = bool(options.get("media", False))
         return Settings(
             timeout=max(1.0, min(float(options.get("timeout", 6)), 30)),
             retries=max(0, min(int(options.get("retries", 0)), 3)),
@@ -126,8 +129,55 @@ class TaskManager:
             prefix="【二手出售】",
             keywords=keywords,
             post_types=post_types,
-            media=bool(options.get("media", False)),
+            media=media,
+            images=media and bool(options.get("images", True)),
+            videos=media and bool(options.get("videos", True)),
         )
+
+    def _classify_forum_failure(self, probe_tid: int) -> tuple[dict[str, str], str]:
+        """Recheck independent paths instead of guessing from one failed request."""
+        diagnostic = Crawler(Settings(
+            timeout=5, retries=0, comments=False, comment_page_size=20,
+            max_comment_pages=1, prefix="【二手出售】", keywords=(),
+            post_types=(), media=False,
+        ))
+        try:
+            list_ok = bool(diagnostic.fetch_forum_page(MARKET_FID, 1, 20))
+        except Exception:
+            list_ok = False
+        detail_ok = diagnostic.probe_thread_endpoint(probe_tid)
+        if list_ok:
+            status = {
+                "code": "transient_timeout",
+                "label": "当前可用，本次请求超时",
+                "detail": "小页列表与帖子详情复检均可连接",
+            }
+            message = (
+                "交易区列表本次读取超时；复检显示服务器当前可连接，"
+                "可能是单页瞬时超时，请稍后重试"
+            )
+        elif detail_ok:
+            status = {
+                "code": "list_degraded",
+                "label": "详情可连接，列表接口异常或繁忙",
+                "detail": "帖子详情有效，但小页列表复检失败",
+            }
+            message = (
+                "交易区列表读取超时；帖子详情仍可连接，"
+                "列表接口可能繁忙或异常，请稍后重试"
+            )
+        else:
+            status = {
+                "code": "unreachable",
+                "label": "无法连接",
+                "detail": "小页列表与帖子详情复检均失败",
+            }
+            message = (
+                "交易区列表和帖子详情均无法连接；"
+                "请确认当前使用内地 IP，或稍后重试"
+            )
+        self._update(server_status=status)
+        return status, message
 
     def _process_range(self, tids: list[int], options: dict[str, Any], *, frontier: bool = False) -> tuple[dict[int, str], dict[int, int]]:
         import concurrent.futures
@@ -255,10 +305,10 @@ class TaskManager:
         while page <= max_pages and not self.stop_event.is_set():
             try:
                 rows = crawler.fetch_forum_page(MARKET_FID, page, list_step)
-            except (urllib.error.URLError, TimeoutError, ConnectionError) as exc:
-                raise RuntimeError(
-                    "交易区列表读取超时；请确认当前使用内地 IP，或稍后重试"
-                ) from exc
+            except (urllib.error.URLError, TimeoutError, ConnectionError,
+                    json.JSONDecodeError, RuntimeError) as exc:
+                _, message = self._classify_forum_failure(max(cursor - 1, 1))
+                raise RuntimeError(message) from exc
             if not rows:
                 break
             ordinary = [row for row in rows if is_market_post(row)]
@@ -435,7 +485,8 @@ class Repository:
                 "items": items,
                 "excluded_on_page": sum(bool(post.get("search_excluded")) for post in items)}
 
-    def post(self, tid: int, hydrate: bool = False) -> dict[str, Any] | None:
+    def post(self, tid: int, hydrate: bool = False, *,
+             images: bool = True, videos: bool = True) -> dict[str, Any] | None:
         with contextlib.closing(self.connect()) as db:
             row = db.execute("SELECT data FROM posts WHERE tid=?", (tid,)).fetchone()
             favorite = db.execute("SELECT 1 FROM favorites WHERE tid=?", (tid,)).fetchone()
@@ -447,6 +498,7 @@ class Repository:
         if hydrate and not (post.get("comments_loaded") and post.get("media_loaded")):
             options = {
                 "timeout": 10, "retries": 1, "comments": True, "media": True,
+                "images": images, "videos": videos,
                 "max_comment_pages": 5,
                 "post_types": ["二手出售", "求购", "召集团购", "商家广告"],
             }
@@ -618,7 +670,7 @@ class Repository:
         post_categories = Counter(p.get("category", "待确认") for p in posts)
         categories = Counter(item.get("status", "待确认") for p in posts for item in post_items(p))
         sale_base = categories["出售"] + categories["已出"]
-        prices = [float(x) for p in posts for x in p.get("prices", []) if number(x)]
+        prices = [price for post in posts for _, price in _market_price_samples(post)]
         daily: defaultdict[str, Counter[str]] = defaultdict(Counter)
         users: Counter[str] = Counter()
         terms: Counter[str] = Counter()
@@ -664,13 +716,20 @@ class Repository:
         with contextlib.closing(self.connect()) as db:
             rows = db.execute("SELECT status, count(*) AS count FROM scan_state GROUP BY status").fetchall()
             total = sum(row["count"] for row in rows)
-            meta = db.execute("SELECT key, value FROM metadata WHERE key IN ('next_tid','last_recorded_id','watch_cursor')").fetchall()
+            meta = db.execute(
+                "SELECT key, value FROM metadata "
+                "WHERE key IN ('next_tid','last_recorded_id','watch_cursor','forum_sync_time')"
+            ).fetchall()
         values = {row["key"]: row["value"] for row in meta}
         last_id = values.get("last_recorded_id")
         if last_id is None:
             next_id = values.get("next_tid") or values.get("watch_cursor")
             last_id = str(int(next_id) - 1) if next_id else None
+        sync_time = values.get("forum_sync_time")
+        last_sync_at = (datetime.fromtimestamp(int(sync_time), timezone.utc).isoformat()
+                        if sync_time else None)
         return {"total_scanned": total, "last_recorded_id": int(last_id) if last_id else None,
+                "last_sync_at": last_sync_at,
                 "statuses": {row["status"]: row["count"] for row in rows}}
 
 
@@ -745,6 +804,35 @@ def clamp_score(value: float) -> float:
     return max(0.0, min(100.0, value))
 
 
+def _market_price_samples(post: dict[str, Any]) -> list[tuple[str, float]]:
+    """Return attributable asking prices, excluding wanted items and duplicates."""
+    samples: list[tuple[str, float]] = []
+    details = [item for item in post.get("item_details", []) if isinstance(item, dict)]
+    sale_items = [item for item in details if item.get("status") in {"出售", "已出"}]
+    for item in sale_items:
+        name = re.sub(r"\s+", " ", str(item.get("name") or "")).strip().casefold()
+        seen: set[float] = set()
+        for raw in item.get("prices", []):
+            if not number(raw):
+                continue
+            price = float(raw)
+            if 1 <= price <= 100000 and price not in seen:
+                samples.append((name or f"tid:{post.get('tid')}", price))
+                seen.add(price)
+    # Old records may only have post-level prices. They are safe to attribute
+    # when the post contains exactly one sale item.
+    if not samples and len(sale_items) == 1:
+        name = re.sub(r"\s+", " ", str(sale_items[0].get("name") or "")).strip().casefold()
+        seen_raw: set[str] = set()
+        for raw in post.get("prices", []):
+            if str(raw) in seen_raw:
+                continue
+            seen_raw.add(str(raw))
+            if number(raw) and 1 <= float(raw) <= 100000:
+                samples.append((name or f"tid:{post.get('tid')}", float(raw)))
+    return samples
+
+
 def market_fear_metrics(row: dict[str, Any],
                         history: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     """Return an adaptive 0–100 stress score against the preceding 30 market days."""
@@ -807,7 +895,14 @@ def market_fear_metrics(row: dict[str, Any],
         level = "贪婪"
     else:
         level = "极度贪婪"
-    sample_confidence = min(1.0, row["posts"] / 20) * 70 + min(1.0, row["price_samples"] / 10) * 30
+    post_score = min(1.0, row["posts"] / 20)
+    price_score = min(1.0, row["price_samples"] / 10)
+    attribution = float(row.get("price_attribution_rate", 1.0))
+    comparable = min(1.0, float(row.get("comparable_price_samples", row["price_samples"])) / 5)
+    # Quantity alone used to overstate confidence. Reward prices that can be
+    # assigned to a sale item and compared with that same item historically.
+    price_quality = price_score * (0.55 * attribution + 0.45 * comparable)
+    sample_confidence = 65 * post_score + 35 * price_quality
     baseline_coverage = min(1.0, len(history) / 14)
     confidence = round(sample_confidence * (0.7 + 0.3 * baseline_coverage), 1)
     return {
@@ -815,6 +910,13 @@ def market_fear_metrics(row: dict[str, Any],
         "fear_level": level,
         "fear_confidence": confidence,
         "fear_baseline_days": len(history),
+        "confidence_components": {
+            "post_coverage": round(post_score * 100, 1),
+            "price_coverage": round(price_score * 100, 1),
+            "price_attribution": round(attribution * 100, 1),
+            "price_comparability": round(comparable * 100, 1),
+            "baseline_coverage": round(baseline_coverage * 100, 1),
+        },
         "fear_components": {
             "liquidity_pressure": round(liquidity, 1),
             "supply_pressure": round(supply, 1),
@@ -865,11 +967,25 @@ def build_daily_market(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
     result: list[dict[str, Any]] = []
     previous: dict[str, Any] | None = None
+    item_price_history: defaultdict[str, list[tuple[str, float]]] = defaultdict(list)
     for day in sorted(grouped):
         records = sorted(grouped[day], key=lambda item: (item[0], int(item[1].get("tid") or 0)))
         day_posts = [item[1] for item in records]
         categories = Counter(item.get("status", "待确认") for post in day_posts for item in post_items(post))
-        prices = [float(value) for post in day_posts for value in post.get("prices", []) if number(value)]
+        named_prices = [sample for post in day_posts for sample in _market_price_samples(post)]
+        prices = [price for _, price in named_prices]
+        sale_item_count = sum(
+            item.get("status") in {"出售", "已出"}
+            for post in day_posts for item in post_items(post)
+        )
+        relative_changes: list[float] = []
+        for name, price in named_prices:
+            prior = [value for prior_day, value in item_price_history[name] if prior_day < day][-20:]
+            if prior:
+                baseline = median(prior)
+                if baseline:
+                    relative_changes.append((price - baseline) / baseline * 100)
+        comparable_change = round(median(relative_changes), 1) if relative_changes else None
         users = {post.get("user_id") or post.get("username") for post in day_posts}
         terms: Counter[str] = Counter()
         for post in day_posts:
@@ -890,6 +1006,9 @@ def build_daily_market(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "median_price": round(median(prices), 2) if prices else None,
             "minimum_price": min(prices) if prices else None, "maximum_price": max(prices) if prices else None,
             "listed_value_sum": round(sum(prices), 2) if prices else None,
+            "price_attribution_rate": round(min(1.0, len(named_prices) / max(1, sale_item_count)), 3),
+            "comparable_price_samples": len(relative_changes),
+            "price_change_method": "matched_items" if relative_changes else "daily_median_fallback",
             "comments": sum(len(post.get("comments", [])) for post in day_posts),
             "images": sum(len(post.get("images", [])) for post in day_posts),
             "xianyu_links": sum(len(post.get("xianyu_links", [])) for post in day_posts),
@@ -897,13 +1016,13 @@ def build_daily_market(posts: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "top_users": [{"name": name, "value": count} for name, count in
                           Counter(post.get("username") or "未知用户" for post in day_posts).most_common(5)],
             "post_change_pct": percent_change(len(day_posts), previous.get("posts") if previous else None),
-            "median_price_change_pct": percent_change(
-                round(median(prices), 2) if prices else None,
-                previous.get("median_price") if previous else None,
-            ),
+            "median_price_change_pct": comparable_change if comparable_change is not None else percent_change(
+                round(median(prices), 2) if prices else None, previous.get("median_price") if previous else None),
             "updated_at": datetime.now(timezone.utc).isoformat(),
         }
         result.append(row)
+        for name, price in named_prices:
+            item_price_history[name].append((day, price))
         previous = row
     return enrich_market_indices(result)
 
@@ -923,6 +1042,8 @@ class HunterManager:
     def _persist_locked(self) -> None:
         payload = []
         for job in self.jobs.values():
+            if job.get("deleted"):
+                continue
             saved = self._copy_job(job)
             saved["enabled"] = bool(job.get("enabled", job.get("active")))
             saved["seen_ids"] = sorted(job.get("seen_ids", set()))
@@ -1114,13 +1235,20 @@ class HunterManager:
 
     def delete_task(self, task_id: str) -> bool:
         with self.lock:
-            job = self.jobs.pop(task_id, None)
+            job = self.jobs.get(task_id)
             if not job:
                 return False
             job["deleted"] = True
             job["enabled"] = False
             job["event"].set()
+            thread = job.get("thread")
             self._persist_locked()
+        if thread and thread is not threading.current_thread():
+            thread.join(timeout=2)
+        with self.lock:
+            if self.jobs.get(task_id) is job:
+                self.jobs.pop(task_id)
+                self._persist_locked()
         return True
 
     def close(self) -> None:
@@ -1154,7 +1282,9 @@ class HunterManager:
 
     def _run(self, task_id: str) -> None:
         with self.lock:
-            job = self.jobs[task_id]
+            job = self.jobs.get(task_id)
+            if job is None:
+                return
             event = job["event"]
         while not event.is_set():
             try:
@@ -1286,7 +1416,9 @@ class Handler(BaseHTTPRequestHandler):
                 post = self.app.repo.post(int(url.path.rsplit("/", 1)[1]))
                 return self.send_json(post or {"error": "帖子不存在"}, 200 if post else 404)
             if url.path == "/api/task":
-                return self.send_json(self.app.tasks.snapshot())
+                payload = self.app.tasks.snapshot()
+                payload["last_sync_at"] = self.app.repo.scan_stats()["last_sync_at"]
+                return self.send_json(payload)
             if url.path == "/api/hunter":
                 return self.send_json(self.app.hunter.snapshot())
             if url.path == "/api/image":
@@ -1353,7 +1485,12 @@ class Handler(BaseHTTPRequestHandler):
                 result = self.app.repo.refresh_post(int(parts[2]))
                 return self.send_json(result or {"error": "帖子不存在"}, 200 if result else 404)
             if len(parts) == 4 and parts[:2] == ["api", "posts"] and parts[3] == "hydrate":
-                result = self.app.repo.post(int(parts[2]), hydrate=True)
+                options = self.read_json()
+                result = self.app.repo.post(
+                    int(parts[2]), hydrate=True,
+                    images=bool(options.get("images", True)),
+                    videos=bool(options.get("videos", True)),
+                )
                 return self.send_json(result or {"error": "帖子不存在"}, 200 if result else 404)
             if self.path == "/api/tasks/watch":
                 ok, message = self.app.tasks.start("watch", self.read_json())
