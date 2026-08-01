@@ -47,7 +47,7 @@
         <div class="header-actions">
           <div class="asof"><small>本次打开时间</small><strong id="openedAt">--:--:--</strong></div>
           <button id="controlBtn" class="button ghost">同步状态</button>
-          <button id="refreshBtn" class="button primary"><span>↻</span> 刷新最新</button>
+          <button id="refreshBtn" class="button primary" title="同步论坛列表中的最新帖子"><span>↻</span> 同步最新帖子</button>
         </div>
       </header>
 
@@ -99,7 +99,7 @@
             </div>
             <div class="confidence-source">
               <strong>置信度来源</strong>
-              <span>当日帖子样本占 70%，明确价格样本占 30%；再按最多 14 个历史基准日，将冷启动修正系数从 70% 逐步提高到 100%。</span>
+              <span>帖子覆盖占 65%，价格质量占 35%；价格质量同时检查出售物品归属、样本量和同物品历史可比性，再按最多 14 个基准日修正冷启动。</span>
               <em id="confidenceSourceCurrent">等待日盘样本</em>
             </div>
           </article>
@@ -146,11 +146,11 @@
       </section>
 
       <section id="control" class="section">
-        <div class="section-head"><div><h2>增量同步</h2><p>只保存一个最新 ID，每次刷新从下一个编号自动追赶到现在</p></div><div class="header-actions"><label class="worker-control" for="syncPostType"><span>拉取类型</span><select id="syncPostType"><option value="二手出售">二手出售</option><option value="求购">求购</option><option value="召集团购">召集团购</option><option value="商家广告">商家广告</option><option value="全部">全部类型</option></select></label><label class="worker-control" for="syncWorkers"><span>并发线程</span><select id="syncWorkers"><option value="4">4</option><option value="8">8</option><option value="16" selected>16</option><option value="24">24</option><option value="32">32</option></select></label><button id="syncNow" class="button primary">刷新到现在</button><button id="stopTask" class="button danger">停止</button></div></div>
+        <div class="section-head"><div><h2>增量同步</h2><p>同步论坛列表中新发布的帖子；不会逐一重新检查历史帖</p></div><div class="header-actions"><label class="worker-control" for="syncPostType"><span>拉取类型</span><select id="syncPostType"><option value="二手出售">二手出售</option><option value="求购">求购</option><option value="召集团购">召集团购</option><option value="商家广告">商家广告</option><option value="全部">全部类型</option></select></label><label class="worker-control" for="syncWorkers"><span>并发线程</span><select id="syncWorkers"><option value="4">4</option><option value="8">8</option><option value="16" selected>16</option><option value="24">24</option><option value="32">32</option></select></label><button id="skipImages" class="button ghost media-toggle" type="button" aria-pressed="false">不解析图片</button><button id="skipVideos" class="button ghost media-toggle" type="button" aria-pressed="false">不解析视频</button><button id="syncNow" class="button primary">同步最新帖子</button><button id="stopTask" class="button danger">停止</button></div></div>
         <div class="sync-grid">
-          <article class="panel cursor-card"><p class="eyebrow">PERSISTED CURSOR</p><span>上次记录的最新 ID</span><strong id="syncLastId">—</strong><small>下次从 <em id="syncNextId">—</em> 开始，不重复扫描历史区间</small></article>
-          <article class="panel flow-card"><div><span>上次最新 ID</span><strong>+ 1</strong></div><i>→</i><div><span>自动分批追赶</span><strong>仅解析目标帖</strong></div><i>→</i><div><span>当前边界</span><strong>保存新 ID</strong></div></article>
-          <article class="panel task-card"><div class="panel-head"><div><h3>当前同步任务</h3><p id="taskMode">IDLE</p></div><i id="taskPulse"></i></div><strong id="taskMessage">空闲</strong><div class="progress"><span id="taskProgress"></span></div><div class="task-stats"><div><span>本次检查</span><strong id="taskProcessed">0</strong></div><div><span>命中交易帖</span><strong id="taskMatched">0</strong></div><div><span>刚处理 TID</span><strong id="taskLastTid">—</strong></div><div><span>运行时间</span><strong id="taskElapsed">0s</strong></div></div><p id="taskError" class="task-error"></p></article>
+          <article class="panel cursor-card"><p class="eyebrow">LAST SYNC</p><span>上次同步时间</span><strong id="syncLastTime">尚未同步</strong><small>已同步至 ID <em id="syncLastId">—</em>，下次从 <em id="syncNextId">—</em> 继续</small></article>
+          <article class="panel flow-card"><div><span>上次同步</span><strong>继续增量</strong></div><i>→</i><div><span>自动分批追赶</span><strong>仅解析目标帖</strong></div><i>→</i><div><span>同步完成</span><strong>记录时间</strong></div></article>
+          <article class="panel task-card"><div class="panel-head"><div><h3>当前同步任务</h3><p id="taskMode">IDLE</p></div><i id="taskPulse"></i></div><strong id="taskMessage">空闲</strong><div class="progress"><span id="taskProgress"></span></div><div class="task-stats"><div><span>本次检查</span><strong id="taskProcessed">0</strong></div><div><span>命中交易帖</span><strong id="taskMatched">0</strong></div><div><span>状态更新时间</span><strong id="taskUpdatedAt">—</strong></div><div><span>运行时间</span><strong id="taskElapsed">0s</strong></div></div><p id="taskError" class="task-error"></p></article>
         </div>
       </section>
     </main>
@@ -159,6 +159,6 @@
   <aside id="detailDrawer" class="drawer" aria-hidden="true"><div class="drawer-head"><div><p class="eyebrow">POST DETAIL</p><h2 id="detailTitle">帖子详情</h2></div><div class="drawer-actions"><button id="sharePost" class="share-button" type="button" aria-label="分享帖子" title="分享帖子"><span aria-hidden="true">↗</span> 分享</button><button id="closeDrawer" aria-label="关闭">×</button></div></div><div id="detailBody" class="drawer-body"></div></aside><div id="backdrop" class="backdrop"></div>
   <div id="imageLightbox" class="image-lightbox" aria-hidden="true"><button id="lightboxClose" aria-label="关闭大图">×</button><img id="lightboxImage" alt=""></div>
   <div id="toast" class="toast" role="status"></div>
-  <script src="/app.js?v=post-share-2"></script>
+  <script src="/app.js?v=server-status-media-1"></script>
 </body>
 </html>

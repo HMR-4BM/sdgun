@@ -96,8 +96,11 @@ STOPWORDS = {
 
 
 class _TextHTML(HTMLParser):
-    def __init__(self) -> None:
+    def __init__(self, *, parse_images: bool = True,
+                 parse_videos: bool = True) -> None:
         super().__init__(convert_charrefs=True)
+        self.parse_images = parse_images
+        self.parse_videos = parse_videos
         self.parts: list[str] = []
         self.images: list[str] = []
         self.links: list[str] = []
@@ -108,18 +111,19 @@ class _TextHTML(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         attrs_d = dict(attrs)
         tag = tag.lower()
-        if tag == "img":
+        if tag == "img" and self.parse_images:
             src = attrs_d.get("data-original") or attrs_d.get("src")
             if src:
                 self.images.append(src)
         if tag == "video":
             self._video_depth += 1
-            if attrs_d.get("poster"):
+            if self.parse_videos and attrs_d.get("poster"):
                 self.video_posters.append(attrs_d["poster"] or "")
-            src = attrs_d.get("data-original") or attrs_d.get("data-src") or attrs_d.get("src")
+            src = (attrs_d.get("data-original") or attrs_d.get("data-src")
+                   or attrs_d.get("src")) if self.parse_videos else None
             if src:
                 self.videos.append(src)
-        elif tag == "source" and self._video_depth:
+        elif tag == "source" and self._video_depth and self.parse_videos:
             src = attrs_d.get("data-original") or attrs_d.get("data-src") or attrs_d.get("src")
             if src:
                 self.videos.append(src)
@@ -139,8 +143,10 @@ class _TextHTML(HTMLParser):
         self.parts.append(data)
 
 
-def clean_rich_content(value: str) -> tuple[str, list[str], list[str], list[str], list[str]]:
-    parser = _TextHTML()
+def clean_rich_content(
+    value: str, *, parse_images: bool = True, parse_videos: bool = True
+) -> tuple[str, list[str], list[str], list[str], list[str]]:
+    parser = _TextHTML(parse_images=parse_images, parse_videos=parse_videos)
     with contextlib.suppress(Exception):
         parser.feed(value or "")
     text = html.unescape("".join(parser.parts))
@@ -412,6 +418,8 @@ class Settings:
     keywords: tuple[str, ...]
     post_types: tuple[str, ...] = ()
     media: bool = True
+    images: bool = True
+    videos: bool = True
 
 
 class Crawler:
@@ -436,6 +444,14 @@ class Crawler:
                 if attempt < self.s.retries:
                     time.sleep(0.15 * (2**attempt))
         raise last or RuntimeError("request failed")
+
+    def probe_thread_endpoint(self, tid: int) -> bool:
+        """Return whether the independent detail endpoint serves valid post data."""
+        try:
+            raw = self._request(THREAD_VIEW_URL.format(tid))
+        except Exception:
+            return False
+        return bool(ROW_RE.search(raw.decode("utf-8", errors="ignore")))
 
     def fetch_thread(self, tid: int) -> tuple[str, dict[str, Any] | None]:
         """Return status and post, using the site's own forum/type metadata."""
@@ -492,12 +508,16 @@ class Crawler:
         if self.s.keywords and not any(keyword_in_raw_page(k, folded_page) for k in self.s.keywords):
             return "skipped_keyword", None
 
+        parse_images = self.s.media and self.s.images
+        parse_videos = self.s.media and self.s.videos
         body, content_images, content_links, content_videos, content_video_posters = clean_rich_content(
-            str(row.get("content", ""))
+            str(row.get("content", "")),
+            parse_images=parse_images,
+            parse_videos=parse_videos,
         )
         # row.pics belongs to the post. Never scrape arbitrary <img> elements.
         pic_urls: list[str] = []
-        for pic in (row.get("pics") or []) if self.s.media else []:
+        for pic in (row.get("pics") or []) if parse_images else []:
             if isinstance(pic, str):
                 pic_urls.append(pic)
             elif isinstance(pic, dict):
@@ -506,15 +526,15 @@ class Crawler:
                         pic_urls.append(str(pic[key])); break
         # row.pics also contains <video poster> thumbnails. They belong to the
         # player and must not be rendered again in the image gallery.
-        video_posters = set(absolute_url(x) for x in content_video_posters) if self.s.media else set()
+        video_posters = set(absolute_url(x) for x in content_video_posters) if parse_videos else set()
         images = [x for x in unique_images(absolute_url(x) for x in pic_urls + content_images)
                   if x not in video_posters]
-        if not self.s.media:
+        if not parse_images:
             images = []
         comments = self.fetch_comments(tid) if self.s.comments and int(row.get("reply_count") or 0) else []
         comment_links = [u for c in comments for u in c.get("links", [])]
         all_links = unique(absolute_url(x) for x in content_links + comment_links)
-        videos = unique(absolute_url(x) for x in content_videos) if self.s.media else []
+        videos = unique(absolute_url(x) for x in content_videos) if parse_videos else []
         xianyu_links = [x for x in all_links if any(h in x.casefold() for h in ("2.taobao.com", "m.tb.cn", "tb.cn", "goofish.com"))]
         item_details = extract_item_details(title, body, comments)
         fallback_category = "求购" if post_type == "求购" else classify(title, body, comments)
